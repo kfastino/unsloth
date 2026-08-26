@@ -85,7 +85,11 @@ class _FakeResponse:
     would let that regress silently, so this models `iter_content` instead.
     """
 
-    def __init__(self, text, chunks = None):
+    def __init__(
+        self,
+        text,
+        chunks = None,
+    ):
         self.encoding = "utf-8"
         self._chunks = chunks if chunks is not None else [text.encode("utf-8")]
 
@@ -99,7 +103,11 @@ class _FakeResponse:
         return False
 
 
-def _install_fake_requests(monkeypatch, text, chunks = None):
+def _install_fake_requests(
+    monkeypatch,
+    text,
+    chunks = None,
+):
     module = types.ModuleType("requests")
     module.get = lambda url, timeout = None, stream = False: _FakeResponse(text, chunks)
     monkeypatch.setitem(sys.modules, "requests", module)

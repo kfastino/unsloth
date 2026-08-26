@@ -90,9 +90,22 @@ _CONVERSIONS = ("encode", "decode")
 # content survives all of them, so `exec(f" import {name}".strip())` executes exactly
 # what the f-string built and the outer call must not read as clean.
 _NORMALISERS = (
-    "strip", "lstrip", "rstrip", "upper", "lower", "title", "capitalize",
-    "casefold", "swapcase", "expandtabs", "removeprefix", "removesuffix",
-    "center", "ljust", "rjust", "zfill",
+    "strip",
+    "lstrip",
+    "rstrip",
+    "upper",
+    "lower",
+    "title",
+    "capitalize",
+    "casefold",
+    "swapcase",
+    "expandtabs",
+    "removeprefix",
+    "removesuffix",
+    "center",
+    "ljust",
+    "rjust",
+    "zfill",
 )
 
 # Constructors that hand the same source on in another type. Same argument as
@@ -196,10 +209,7 @@ def _is_interpolated(node: ast.AST, resolve = None) -> str | None:
                 # `str.encode(s)` and `builtins.str.encode(s)` alike: the receiver
                 # names the type, so the source is the first argument.
                 if _constructor_name(function.value) is not None:
-                    return (
-                        _is_interpolated(node.args[0], resolve)
-                        if node.args else None
-                    )
+                    return _is_interpolated(node.args[0], resolve) if node.args else None
                 # Unwrap the receiver: the conversion changes the type, not the syntax.
                 return _is_interpolated(function.value, resolve)
         constructor = _constructor_name(function)
@@ -360,7 +370,9 @@ class _Visitor(ast.NodeVisitor):
     def _alias(self, name: str) -> str | None:
         """The sink `name` resolves to through an import, innermost scope first."""
         for index in self._visible_scopes():
-            table = self.sink_aliases if index == len(self.sink_aliases) - 1 else self.collected_aliases
+            table = (
+                self.sink_aliases if index == len(self.sink_aliases) - 1 else self.collected_aliases
+            )
             if name in table[index]:
                 return table[index][name]
         return None
@@ -377,7 +389,9 @@ class _Visitor(ast.NodeVisitor):
         for index in self._visible_scopes():
             if name in self.shadowed_sinks[index]:
                 return True
-            table = self.sink_aliases if index == len(self.sink_aliases) - 1 else self.collected_aliases
+            table = (
+                self.sink_aliases if index == len(self.sink_aliases) - 1 else self.collected_aliases
+            )
             if name in table[index]:
                 return False
         return False
@@ -430,9 +444,7 @@ class _Visitor(ast.NodeVisitor):
             self.visit(part)
 
         self.scope.append(node.name)
-        self.scope_kinds.append(
-            "class" if isinstance(node, ast.ClassDef) else "function"
-        )
+        self.scope_kinds.append("class" if isinstance(node, ast.ClassDef) else "function")
         # A fresh scope: a name built in one function says nothing about the same name
         # in another.
         self.tainted.append({})
@@ -445,8 +457,11 @@ class _Visitor(ast.NodeVisitor):
         if not isinstance(node, ast.ClassDef):
             arguments = node.args
             for argument in (
-                *arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs,
-                arguments.vararg, arguments.kwarg,
+                *arguments.posonlyargs,
+                *arguments.args,
+                *arguments.kwonlyargs,
+                arguments.vararg,
+                arguments.kwarg,
             ):
                 if argument is None:
                     continue
@@ -573,9 +588,7 @@ class _Visitor(ast.NodeVisitor):
             self._bind(node.target, next((r for r in reasons if r is not None), None))
         self.visit(node.target)
         # `for exec in callbacks:` calls the callback in the body, not the builtin.
-        names = {
-            child.id for child in ast.walk(node.target) if isinstance(child, ast.Name)
-        }
+        names = {child.id for child in ast.walk(node.target) if isinstance(child, ast.Name)}
         saved_scope = self._shadow_locals(names)
         for statement in node.body + node.orelse:
             self.visit(statement)
@@ -866,8 +879,7 @@ class _Visitor(ast.NodeVisitor):
             self.visit(default)
         shadowed = {
             arg.arg
-            for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs,
-                        args.vararg, args.kwarg)
+            for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs, args.vararg, args.kwarg)
             if arg is not None
         }
         saved = dict(self.tainted[-1])
@@ -1295,7 +1307,7 @@ def _neutralised(source: str) -> str:
                         consumed += 1
                         if not piece.endswith("\\"):
                             break
-                    argument = _magic_argument(" ".join(joined).lstrip()[len(magic) + 1:])
+                    argument = _magic_argument(" ".join(joined).lstrip()[len(magic) + 1 :])
                     out.append(indent + argument)
                     out.extend([""] * (consumed - 1))
                     skip = consumed - 1
