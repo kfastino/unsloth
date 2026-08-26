@@ -335,6 +335,13 @@ class _Visitor(ast.NodeVisitor):
         self.tainted.pop()
         self.scope.pop()
         self.scope_kinds.pop()
+        # The statement ends by binding its own name out here, to a function or a
+        # class. Leaving the old entry in place reported
+        # `payload = f"import {user}"; def payload(): pass; exec(payload)`, where the
+        # sink can only ever be handed a function object. Unlike a conditional rebind
+        # this one is unconditional: reaching the end of the statement means the name
+        # was assigned.
+        self.tainted[-1].pop(node.name, None)
 
     visit_FunctionDef = _enter
     visit_AsyncFunctionDef = _enter
@@ -591,8 +598,10 @@ def _magic_argument(rest: str) -> str:
 # at the start of the line and the plain check below never fired. Neither the raw text
 # nor the neutralised text parsed, so the whole cell - including any sink after it - was
 # skipped. The target list is restricted to names, attributes, subscripts and the commas
-# and brackets that separate them, so an ordinary `x = y != z` cannot match.
-_CAPTURE = re.compile(r"^(\s*)([\w.,()\[\]\s]+?)\s*=\s*[!%](?!=)")
+# and brackets that separate them, plus the quotes a subscript key needs, so
+# `outputs["log"] = !printf hello` matches while an ordinary `x = y != z` cannot: the
+# character class has no `=` in it, so the target can never span the assignment.
+_CAPTURE = re.compile(r"""^(\s*)([\w.,()\[\]\s'"]+?)\s*=\s*([!%])(?!=)(.*)$""")
 
 
 def _string_open_lines(source: str) -> frozenset:
@@ -666,9 +675,19 @@ def _neutralised(source: str) -> str:
             continue
         capture = _CAPTURE.match(line)
         if capture:
-            # The shell or magic result is opaque, so binding None both keeps the
-            # statement parseable and correctly leaves the target untracked.
-            out.append(f"{capture.group(1)}{capture.group(2)} = None")
+            indent, target, operator, rest = capture.groups()
+            magic = rest.split(maxsplit = 1)[0] if operator == "%" and rest.strip() else ""
+            if magic in _CODE_MAGICS and rest.partition(" ")[2].strip():
+                # `t = %timeit -o exec(payload)` captures a result, but IPython still
+                # runs the Python argument. Replacing the whole line dropped the sink,
+                # which is the same mistake the bare `%time exec(...)` handling already
+                # fixed once.
+                argument = _magic_argument(rest.partition(" ")[2])
+                out.append(f"{indent}{target} = {argument}")
+            else:
+                # The shell or magic result is opaque, so binding None both keeps the
+                # statement parseable and correctly leaves the target untracked.
+                out.append(f"{indent}{target} = None")
             continuing = line.rstrip().endswith("\\")
             continue
         if continuing:
@@ -693,6 +712,21 @@ def _neutralised(source: str) -> str:
     return "\n".join(out)
 
 
+def _runs_python(argument: str) -> bool:
+    """Whether a `%%script` argument names a Python interpreter.
+
+    Options are skipped and the command is read off the front, so
+    `%%script --no-raise-error python3` is recognised. Only the executable name is
+    considered, which keeps `/usr/bin/python3.13` and a bare `python` on the same
+    footing.
+    """
+    for token in argument.split():
+        if token.startswith("-"):
+            continue
+        return token.rsplit("/", 1)[-1].split("\\")[-1].startswith("python")
+    return False
+
+
 def _foreign_cell_magic(code: str) -> str | None:
     """The `%%magic` name when it makes the whole cell stop being Python.
 
@@ -708,8 +742,17 @@ def _foreign_cell_magic(code: str) -> str | None:
             continue
         if not line.startswith("%%"):
             return None
-        magic = line[2:].split(maxsplit = 1)[0] if line[2:].strip() else ""
-        return None if magic in _CODE_MAGICS or magic in ("python", "python3") else magic
+        if not line[2:].strip():
+            return None
+        magic, _, argument = line[2:].strip().partition(" ")
+        if magic in _CODE_MAGICS or magic in ("python", "python3"):
+            return None
+        if magic in ("script", "bash") and _runs_python(argument):
+            # `%%script python` hands the body to a Python interpreter, so it is
+            # Python and has to be scanned. Reading only the magic name classified it
+            # as foreign and skipped the cell entirely.
+            return None
+        return magic
     return None
 
 
