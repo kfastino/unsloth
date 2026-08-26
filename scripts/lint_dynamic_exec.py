@@ -35,6 +35,7 @@ import ast
 import hashlib
 import json
 import re
+import shlex
 import sys
 import warnings
 from pathlib import Path
@@ -261,9 +262,12 @@ def _pattern_bindings(pattern: ast.AST, captures_subject: bool = True):
     """
     if isinstance(pattern, ast.MatchAs):
         if pattern.name is not None:
-            yield pattern.name, captures_subject and pattern.pattern is None
+            # `case _ as payload` and `case str() as payload` both bind the whole value
+            # the pattern matched, which at the top level IS the subject. Requiring the
+            # subpattern to be absent treated those as binding something else.
+            yield pattern.name, captures_subject
         if pattern.pattern is not None:
-            yield from _pattern_bindings(pattern.pattern, captures_subject)
+            yield from _pattern_bindings(pattern.pattern, False)
     elif isinstance(pattern, ast.MatchStar):
         if pattern.name is not None:
             yield pattern.name, False
@@ -489,6 +493,11 @@ class _Visitor(ast.NodeVisitor):
         # this one is unconditional: reaching the end of the statement means the name
         # was assigned.
         self.tainted[-1].pop(node.name, None)
+        # `def exec(x): ...` makes a later bare `exec(...)` that function.
+        if self._binds_over_sink(node.name):
+            self.shadowed_sinks[-1].add(node.name)
+            self.sink_aliases[-1].pop(node.name, None)
+            self.collected_aliases[-1].pop(node.name, None)
 
     visit_FunctionDef = _enter
     visit_AsyncFunctionDef = _enter
@@ -530,6 +539,9 @@ class _Visitor(ast.NodeVisitor):
         if node.value is not None:
             self.visit(node.value)
             self._bind(node.target, reason)
+        # An annotated assignment binds like any other one.
+        if node.value is not None:
+            self._shadow_assignment(node.target, node.value)
         # The annotation is evaluated AFTER the store, so a runtime annotation
         # observes the new binding: `payload: exec(payload) = f"import {name}"`
         # executes the value that was just assigned. Confirmed on CPython 3.13.
@@ -609,16 +621,19 @@ class _Visitor(ast.NodeVisitor):
         self.visit(node.subject)
         reason = _is_interpolated(node.subject, self.tainted[-1].get)
         for case in node.cases:
+            bound = [name for name, _ in _pattern_bindings(case.pattern)]
+            saved_scope = self._shadow_locals(bound)
             for name, captures_subject in _pattern_bindings(case.pattern):
-                self.tainted[-1][name] = (
-                    f"{reason} via `{name}`" if (reason is not None and captures_subject) else None
-                )
+                self.tainted[-1][name] = f"{reason} via `{name}`" if (
+                    reason is not None and captures_subject
+                ) else None
                 if self.tainted[-1][name] is None:
                     self.tainted[-1].pop(name, None)
             if case.guard is not None:
                 self.visit(case.guard)
             for statement in case.body:
                 self.visit(statement)
+            self._restore_locals(saved_scope)
 
     def visit_ExceptHandler(self, node: ast.ExceptHandler):
         """`except Exception as payload:` rebinds, and then deletes, the name.
@@ -1037,13 +1052,31 @@ def _notebook_code_cells(path: Path) -> list[tuple[int, str]]:
             f"{_relative(path)}: could not be read as a notebook "
             f"({error.__class__.__name__}), so its code cells were not checked"
         ) from None
+    if not isinstance(document, dict) or not isinstance(document.get("cells", []), list):
+        raise ScanError(
+            f"{_relative(path)}: is not a notebook document, so its code cells were "
+            f"not checked"
+        )
     cells = []
     for index, cell in enumerate(document.get("cells", [])):
-        if cell.get("cell_type") != "code":
+        if not isinstance(cell, dict) or cell.get("cell_type") != "code":
             continue
         source = cell.get("source", "")
         if isinstance(source, list):
+            if not all(isinstance(piece, str) for piece in source):
+                raise ScanError(
+                    f"{_relative(path)}#cell{index}: `source` is a list of something "
+                    f"other than strings, so the cell was not checked"
+                )
             source = "".join(source)
+        if not isinstance(source, str):
+            # A cell whose `source` is a number or an object is not something this can
+            # read. Failing closed puts it in the unscannable count instead of raising
+            # AttributeError out of the walk and taking every remaining file with it.
+            raise ScanError(
+                f"{_relative(path)}#cell{index}: `source` is "
+                f"{type(source).__name__}, not text, so the cell was not checked"
+            )
         cells.append((index, source))
     return cells
 
@@ -1202,8 +1235,9 @@ def _neutralised(source: str) -> str:
         capture = _capture_target(line)
         if capture:
             indent, target, operator, rest, _targets = capture
-            magic = rest.split(maxsplit = 1)[0] if operator == "%" and rest.strip() else ""
-            tail = rest.partition(" ")[2]
+            pieces = rest.split(maxsplit = 1)
+            magic = pieces[0] if operator == "%" and pieces else ""
+            tail = pieces[1] if len(pieces) > 1 else ""
             if magic in _CODE_MAGICS and (tail.strip() or line.rstrip().endswith("\\")):
                 # `t = %timeit -o exec(payload)` captures a result, but IPython still
                 # runs the Python argument. Replacing the whole line dropped the sink,
@@ -1245,21 +1279,33 @@ def _neutralised(source: str) -> str:
                 # Store context only. `outputs[payload] = !cmd` READS `payload` to
                 # index with; it does not rebind it, and clearing it there turned this
                 # cleanup into a bypass.
-                names = sorted(
-                    {
-                        child.id
-                        for node in _targets
-                        for child in ast.walk(node)
-                        if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store)
-                    }
-                )
+                names = sorted({
+                    child.id
+                    for node in _targets
+                    for child in ast.walk(node)
+                    if isinstance(child, ast.Name)
+                    and isinstance(child.ctx, ast.Store)
+                })
                 # A target that is not a plain name is KEPT rather than dropped:
                 # `result = outputs[exec(payload)] = !cmd` still evaluates the
                 # subscript, so replacing the whole chain with `result = None` threw
                 # the sink away. Each such target is spliced back into the chain.
-                kept = [ast.unparse(node) for node in _targets if not isinstance(node, ast.Name)]
-                left = " = ".join([*kept, *names]) if (kept or names) else target
-                out.append(f"{indent}{left} = None")
+                # Original order, because assignment is left to right and the
+                # targets have effects: in `payload = table[exec(payload)] = !cmd`
+                # the magic result clears `payload` before the subscript is
+                # evaluated, so moving the subscript first reported the `exec`
+                # against a value it can no longer see.
+                pieces = [
+                    child.id if isinstance(child, ast.Name) else ast.unparse(child)
+                    for child in _targets
+                ]
+                left = " = ".join(pieces) if pieces else target
+                # The names are cleared in trailing statements on the SAME physical
+                # line, so the targets keep their order and their effects, every bound
+                # name still loses any stale reason, and the cell's line numbering is
+                # unchanged - findings below have to keep pointing at the right line.
+                clears = "".join(f"; {name} = None" for name in names)
+                out.append(f"{indent}{left} = None{clears}")
             continuing = line.rstrip().endswith("\\")
             continue
         if continuing:
@@ -1269,7 +1315,11 @@ def _neutralised(source: str) -> str:
         stripped = line.lstrip()
         automagic = stripped.split(maxsplit = 1)[0] if stripped else ""
         remainder = stripped.split(maxsplit = 1)
-        if automagic in _CODE_MAGICS and len(remainder) > 1 and not stripped.startswith(("%", "!")):
+        if (
+            automagic in _CODE_MAGICS
+            and len(remainder) > 1
+            and not stripped.startswith(("%", "!"))
+        ):
             # IPython's automagic lets `timeit exec(payload)` run the sink without a
             # leading `%`. The raw cell does not parse and nothing here rewrote the
             # line, so the cell was skipped along with the sink. Only rewritten when
@@ -1279,21 +1329,34 @@ def _neutralised(source: str) -> str:
             # out of `_neutralised`, which aborted the whole run rather than skipping
             # one cell.
             indent = line[: len(line) - len(stripped)]
-            argument = _magic_argument(remainder[1])
+            # A backslash continuation puts the rest on the following physical lines,
+            # exactly as for the percent-prefixed spelling.
+            joined, consumed = [remainder[1].rstrip().removesuffix("\\")], 1
+            while line.rstrip().endswith("\\") and number + consumed < len(lines):
+                piece = lines[number + consumed].rstrip()
+                joined.append(piece.removesuffix("\\"))
+                consumed += 1
+                if not piece.endswith("\\"):
+                    break
+            argument = _magic_argument(" ".join(joined).strip())
             try:
                 ast.parse(argument)
             except (SyntaxError, ValueError):
                 pass
             else:
                 out.append(indent + argument)
-                continuing = line.rstrip().endswith("\\")
+                out.extend([""] * (consumed - 2 if consumed > 1 else 0))
+                skip = consumed - 1
+                continuing = False
                 continue
         if stripped.startswith(("%", "!")):
             indent = line[: len(line) - len(stripped)]
             # A line magic that takes code keeps its argument; the magic itself is not
             # Python but what follows it is, and dropping the line hid the sink.
             if stripped.startswith("%") and not stripped.startswith("%%"):
-                magic, _, rest = stripped[1:].partition(" ")
+                head = stripped[1:].split(maxsplit = 1)
+                magic = head[0] if head else ""
+                rest = head[1] if len(head) > 1 else ""
                 if magic in _CODE_MAGICS and line.rstrip().endswith("\\"):
                     # `%timeit \` puts the Python on the following physical lines.
                     # Emitting the backslash and blanking what followed threw the sink
@@ -1339,7 +1402,12 @@ def _runs_python(argument: str) -> bool:
     considered, which keeps `/usr/bin/python3.13` and a bare `python` on the same
     footing.
     """
-    tokens = argument.split()
+    try:
+        # `%%script --out "my captured" python` quotes like a shell, so a plain split
+        # made `"my` the option value and `captured"` the command.
+        tokens = shlex.split(argument)
+    except ValueError:
+        tokens = argument.split()
     index = 0
     while index < len(tokens):
         token = tokens[index]
@@ -1369,7 +1437,15 @@ def _runs_python(argument: str) -> bool:
                 # `env -u FOO python`: `-u/--unset` and `-C/--chdir` take a mandatory
                 # argument, so skipping only the option left `FOO` looking like the
                 # command and the Python cell was classified as foreign.
-                if token.split("=", 1)[0] in _ENV_VALUE_OPTIONS and "=" not in token:
+                name = token.split("=", 1)[0]
+                if name in ("-S", "--split-string"):
+                    # `env -S "python -u"` puts the whole command in one argument, so
+                    # the wrapped command is inside that value rather than after it.
+                    value = token.split("=", 1)[1] if "=" in token else (
+                        tokens[index + 1] if index + 1 < len(tokens) else ""
+                    )
+                    return _runs_python(value)
+                if name in _ENV_VALUE_OPTIONS and "=" not in token:
                     index += 2
                 else:
                     index += 1
@@ -1395,7 +1471,9 @@ def _foreign_cell_magic(code: str) -> str | None:
             return None
         if not line[2:].strip():
             return None
-        magic, _, argument = line[2:].strip().partition(" ")
+        pieces = line[2:].split(maxsplit = 1)
+        magic = pieces[0] if pieces else ""
+        argument = pieces[1] if len(pieces) > 1 else ""
         if magic in _CODE_MAGICS or magic in ("python", "python3"):
             return None
         if magic == "script" and _runs_python(argument):
@@ -1563,7 +1641,7 @@ def collect_paths(targets: list[str]) -> tuple[list[Path], list[str]]:
                 paths.extend(
                     p
                     for p in root.rglob(pattern)
-                    if p.is_file() and "tests" not in _exclusion_parts(p, root)
+                    if p.is_file() and not _EXCLUDED_PARTS & set(_exclusion_parts(p, root))
                 )
             if len(paths) == before:
                 # An existing but empty directory resolved "successfully" while
@@ -1579,6 +1657,19 @@ def collect_paths(targets: list[str]) -> tuple[list[Path], list[str]]:
                 f"{target}: requested scan target does not exist, so nothing under it was checked"
             )
     return paths, missing
+
+
+# Directory names a recursive scan never descends into. `tests` is excluded because a
+# test legitimately keeps the removed `exec`/`eval` around as an oracle. The rest are
+# not part of any commit: a checkout that has run a frontend install or a plugin build
+# carries third-party and generated Python that this gate has no business failing on,
+# and `--update` would otherwise write allowlist entries for files a clean CI checkout
+# does not even have.
+_EXCLUDED_PARTS = frozenset({
+    "tests", "node_modules", "build", "dist", ".venv", "venv", "site-packages",
+    ".git", ".tox", ".mypy_cache", ".pytest_cache", "__pycache__", ".ipynb_checkpoints",
+    ".eggs",
+})
 
 
 def _exclusion_parts(path: Path, root: Path) -> tuple[str, ...]:

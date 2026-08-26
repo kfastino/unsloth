@@ -33,11 +33,34 @@ _REPO = _HERE.parent.parent
 _WORKFLOW = _REPO / ".github" / "workflows" / "workflow-trigger-lint.yml"
 
 
+def _module_level_statements(body):
+    """Statements that run at import time, including inside module-level control flow.
+
+    `try: import torch / except ImportError: ...` is the ordinary way to write an
+    optional dependency, and it executes during collection exactly like a bare import.
+    Looking only at direct children of the module missed it, so a file written that way
+    was reported as light, never added to the workflow's ignore list, and would stop
+    collecting on the light runner - the failure this guard exists to prevent.
+
+    Function and class bodies are still excluded: an import in there is paid lazily.
+    """
+    for node in body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        yield node
+        for field in ("body", "orelse", "finalbody", "handlers"):
+            for child in getattr(node, field, []) or []:
+                if isinstance(child, ast.ExceptHandler):
+                    yield from _module_level_statements(child.body)
+                elif isinstance(child, ast.stmt):
+                    yield from _module_level_statements([child])
+
+
 def _module_level_heavy_imports(path):
     """Top-level import names only. An import inside a function is paid lazily."""
     tree = ast.parse(path.read_text(encoding = "utf-8"))
     found = set()
-    for node in tree.body:
+    for node in _module_level_statements(tree.body):
         names = []
         if isinstance(node, ast.Import):
             names = [alias.name for alias in node.names]
