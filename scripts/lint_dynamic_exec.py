@@ -1061,8 +1061,7 @@ class _Visitor(ast.NodeVisitor):
             self.visit(default)
         shadowed = {
             arg.arg
-            for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs,
-                        args.vararg, args.kwarg)
+            for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs, args.vararg, args.kwarg)
             if arg is not None
         }
         saved = dict(self.tainted[-1])
@@ -1248,8 +1247,7 @@ def _notebook_code_cells(path: Path) -> list[tuple[int, str]]:
         ) from None
     if not isinstance(document, dict) or not isinstance(document.get("cells", []), list):
         raise ScanError(
-            f"{_relative(path)}: is not a notebook document, so its code cells were "
-            f"not checked"
+            f"{_relative(path)}: is not a notebook document, so its code cells were " f"not checked"
         )
     cells = []
     for index, cell in enumerate(document.get("cells", [])):
@@ -1359,7 +1357,7 @@ def _capture_target(line: str):
             continue
         if len(tree.body) != 1 or not isinstance(tree.body[0], ast.Assign):
             continue
-        return indent, target, operator, line[match.end():], tree.body[0].targets
+        return indent, target, operator, line[match.end() :], tree.body[0].targets
     return None
 
 
