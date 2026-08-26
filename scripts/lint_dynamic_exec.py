@@ -227,17 +227,27 @@ def _is_interpolated(node: ast.AST, resolve = None) -> str | None:
     return None
 
 
-def _sink_name(function: ast.AST) -> str | None:
+def _sink_name(function: ast.AST, aliases: dict | None = None) -> str | None:
     """The sink this call target names, if any.
 
     Both `exec(...)` and `builtins.exec(...)` execute. Matching only `ast.Name` meant
     the second form passed the lint with zero findings.
+
+    `aliases` maps a local name to the sink it was imported as. `from builtins import
+    exec as run` gives `run` the same builtin, so reading only the spelling at the call
+    site missed it. Only names bound by an import from `builtins` are recorded, which
+    keeps this to a fact stated in the file rather than a guess about what a name holds.
     """
-    if isinstance(function, ast.Name) and function.id in SINKS:
-        return function.id
+    if isinstance(function, ast.Name):
+        if function.id in SINKS:
+            return function.id
+        if aliases and function.id in aliases:
+            return aliases[function.id]
     if isinstance(function, ast.Attribute) and function.attr in SINKS:
-        if isinstance(function.value, ast.Name) and function.value.id == "builtins":
-            return f"builtins.{function.attr}"
+        if isinstance(function.value, ast.Name):
+            module = function.value.id
+            if module == "builtins" or (aliases or {}).get(f"module:{module}"):
+                return f"builtins.{function.attr}"
     return None
 
 
@@ -278,6 +288,9 @@ class _Visitor(ast.NodeVisitor):
         self.findings: list[dict] = []
         # name -> reason, for locals bound to a built string in the current scope.
         self.tainted: list[dict[str, str]] = [{}]
+        # Local name -> the sink it names, for `from builtins import exec as run` and
+        # `import builtins as b`. One flat map: an import binds for the whole module.
+        self.sink_aliases: dict[str, str] = {}
 
     def _qualname(self) -> str:
         inner = ".".join(self.scope) if self.scope else "<module>"
@@ -487,8 +500,51 @@ class _Visitor(ast.NodeVisitor):
         else:
             self.tainted[-1][target.id] = f"{reason} via `{target.id}`"
 
+    def visit_ImportFrom(self, node: ast.ImportFrom):
+        """`from builtins import exec as run` makes `run` the same builtin."""
+        if node.module == "builtins" and not node.level:
+            for alias in node.names:
+                if alias.name in SINKS:
+                    self.sink_aliases[alias.asname or alias.name] = alias.name
+        self.generic_visit(node)
+
+    def visit_Import(self, node: ast.Import):
+        """`import builtins as b` makes `b.exec` the same builtin."""
+        for alias in node.names:
+            if alias.name == "builtins" and alias.asname:
+                self.sink_aliases[f"module:{alias.asname}"] = "builtins"
+        self.generic_visit(node)
+
+    def visit_Lambda(self, node: ast.Lambda):
+        """A lambda parameter shadows the enclosing name for the body.
+
+        `payload = f"import {name}"` followed by `run = lambda payload: exec(payload)`
+        was reported although the sink can only ever see the argument the caller
+        passes. The parameters are the part that is certainly shadowed, so only they
+        are removed, and only for the body.
+
+        Note what is deliberately NOT done here: the body still reads the enclosing map
+        otherwise, because `lambda: exec(payload)` really does close over the outer
+        `payload` and that is a true finding. Clearing the whole scope, as a `def`
+        does, would trade this false positive for a false negative. The asymmetry with
+        `_enter` is the existing documented limit on cross-scope taint, not something
+        introduced here.
+        """
+        args = node.args
+        for default in (*args.defaults, *(d for d in args.kw_defaults if d is not None)):
+            self.visit(default)
+        shadowed = {
+            arg.arg
+            for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs,
+                        args.vararg, args.kwarg)
+            if arg is not None
+        }
+        saved = {name: self.tainted[-1].pop(name) for name in shadowed if name in self.tainted[-1]}
+        self.visit(node.body)
+        self.tainted[-1].update(saved)
+
     def visit_Call(self, node: ast.Call):
-        sink = _sink_name(node.func)
+        sink = _sink_name(node.func, self.sink_aliases)
         argument = _source_argument(node, sink) if sink is not None else None
         if argument is not None:
             # The taint lookup has to happen wherever the unwrapping stops, not only
