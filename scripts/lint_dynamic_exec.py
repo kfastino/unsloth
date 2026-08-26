@@ -570,9 +570,9 @@ class _Visitor(ast.NodeVisitor):
         reason = _is_interpolated(node.subject, self.tainted[-1].get)
         for case in node.cases:
             for name, captures_subject in _pattern_bindings(case.pattern):
-                self.tainted[-1][name] = f"{reason} via `{name}`" if (
-                    reason is not None and captures_subject
-                ) else None
+                self.tainted[-1][name] = (
+                    f"{reason} via `{name}`" if (reason is not None and captures_subject) else None
+                )
                 if self.tainted[-1][name] is None:
                     self.tainted[-1].pop(name, None)
             if case.guard is not None:
@@ -1093,22 +1093,19 @@ def _neutralised(source: str) -> str:
                 # Store context only. `outputs[payload] = !cmd` READS `payload` to
                 # index with; it does not rebind it, and clearing it there turned this
                 # cleanup into a bypass.
-                names = sorted({
-                    child.id
-                    for node in _targets
-                    for child in ast.walk(node)
-                    if isinstance(child, ast.Name)
-                    and isinstance(child.ctx, ast.Store)
-                })
+                names = sorted(
+                    {
+                        child.id
+                        for node in _targets
+                        for child in ast.walk(node)
+                        if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store)
+                    }
+                )
                 # A target that is not a plain name is KEPT rather than dropped:
                 # `result = outputs[exec(payload)] = !cmd` still evaluates the
                 # subscript, so replacing the whole chain with `result = None` threw
                 # the sink away. Each such target is spliced back into the chain.
-                kept = [
-                    ast.unparse(node)
-                    for node in _targets
-                    if not isinstance(node, ast.Name)
-                ]
+                kept = [ast.unparse(node) for node in _targets if not isinstance(node, ast.Name)]
                 left = " = ".join([*kept, *names]) if (kept or names) else target
                 out.append(f"{indent}{left} = None")
             continuing = line.rstrip().endswith("\\")
@@ -1120,11 +1117,7 @@ def _neutralised(source: str) -> str:
         stripped = line.lstrip()
         automagic = stripped.split(maxsplit = 1)[0] if stripped else ""
         remainder = stripped.split(maxsplit = 1)
-        if (
-            automagic in _CODE_MAGICS
-            and len(remainder) > 1
-            and not stripped.startswith(("%", "!"))
-        ):
+        if automagic in _CODE_MAGICS and len(remainder) > 1 and not stripped.startswith(("%", "!")):
             # IPython's automagic lets `timeit exec(payload)` run the sink without a
             # leading `%`. The raw cell does not parse and nothing here rewrote the
             # line, so the cell was skipped along with the sink. Only rewritten when
