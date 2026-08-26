@@ -291,6 +291,8 @@ class _Visitor(ast.NodeVisitor):
         # Local name -> the sink it names, for `from builtins import exec as run` and
         # `import builtins as b`. One flat map: an import binds for the whole module.
         self.sink_aliases: dict[str, str] = {}
+        # Sink names this file rebound to something else, e.g. `from re import compile`.
+        self.shadowed_sinks: set[str] = set()
 
     def _qualname(self) -> str:
         inner = ".".join(self.scope) if self.scope else "<module>"
@@ -502,18 +504,44 @@ class _Visitor(ast.NodeVisitor):
 
     def visit_ImportFrom(self, node: ast.ImportFrom):
         """`from builtins import exec as run` makes `run` the same builtin."""
-        if node.module == "builtins" and not node.level:
-            for alias in node.names:
-                if alias.name in SINKS:
-                    self.sink_aliases[alias.asname or alias.name] = alias.name
+        for alias in node.names:
+            bound = alias.asname or alias.name
+            if node.module == "builtins" and not node.level and alias.name in SINKS:
+                self.sink_aliases[bound] = alias.name
+                self.shadowed_sinks.discard(bound)
+            else:
+                self.tainted[-1].pop(bound, None)
+                self._shadow_sink(bound)
         self.generic_visit(node)
 
     def visit_Import(self, node: ast.Import):
-        """`import builtins as b` makes `b.exec` the same builtin."""
+        """`import builtins as b` makes `b.exec` the same builtin.
+
+        An import also BINDS, unconditionally: `import json as payload` after
+        `payload = f"import {user}"` means the sink can only ever be handed a module,
+        because an import that fails raises instead of falling through. Same argument
+        as the `def`/`class` rebinding, so it gets the same treatment.
+        """
         for alias in node.names:
             if alias.name == "builtins" and alias.asname:
                 self.sink_aliases[f"module:{alias.asname}"] = "builtins"
+            bound = alias.asname or alias.name.split(".")[0]
+            self.tainted[-1].pop(bound, None)
+            self._shadow_sink(bound)
         self.generic_visit(node)
+
+    def _shadow_sink(self, name: str) -> None:
+        """Record that `name` was bound to something that is not the builtin.
+
+        `from re import compile` then `compile(f"^{name}$")` is a regular expression,
+        not dynamic execution, and failing a hard gate on it is the worst kind of false
+        positive: correct code that cannot be made to pass. Only bindings this file
+        states are honoured, and `builtins.compile(...)` is unaffected because it names
+        the builtin explicitly rather than through the shadowed name.
+        """
+        if name in SINKS:
+            self.shadowed_sinks.add(name)
+        self.sink_aliases.pop(name, None)
 
     def visit_Lambda(self, node: ast.Lambda):
         """A lambda parameter shadows the enclosing name for the body.
@@ -545,6 +573,8 @@ class _Visitor(ast.NodeVisitor):
 
     def visit_Call(self, node: ast.Call):
         sink = _sink_name(node.func, self.sink_aliases)
+        if isinstance(node.func, ast.Name) and node.func.id in self.shadowed_sinks:
+            sink = None
         argument = _source_argument(node, sink) if sink is not None else None
         if argument is not None:
             # The taint lookup has to happen wherever the unwrapping stops, not only
@@ -649,15 +679,33 @@ def _magic_argument(rest: str) -> str:
     return rest
 
 
-# `out = !ls`, `files, err = !ls`, `t = %timeit -o f()`. IPython's capture syntax is an
-# assignment whose right hand side is a magic or a shell escape, so the `!` or `%` is not
-# at the start of the line and the plain check below never fired. Neither the raw text
-# nor the neutralised text parsed, so the whole cell - including any sink after it - was
-# skipped. The target list is restricted to names, attributes, subscripts and the commas
-# and brackets that separate them, plus the quotes a subscript key needs, so
-# `outputs["log"] = !printf hello` matches while an ordinary `x = y != z` cannot: the
-# character class has no `=` in it, so the target can never span the assignment.
-_CAPTURE = re.compile(r"""^(\s*)([\w.,()\[\]\s'"]+?)\s*=\s*([!%])(?!=)(.*)$""")
+# `out = !ls`, `files, err = !ls`, `t = %timeit -o f()`, `outputs["run-log"] = !ls`.
+# IPython's capture syntax is an assignment whose right hand side is a magic or a shell
+# escape, so the `!` or `%` is not at the start of the line and the plain check below
+# never fires. Neither the raw text nor the neutralised text parses, so the whole cell -
+# including any sink after it - is skipped.
+#
+# The left hand side is validated by the parser rather than by a character class. Two
+# rounds of widening that class (quotes, then punctuation inside quoted keys) showed it
+# was the wrong tool: a subscript key is an arbitrary Python string. `_capture_target`
+# asks CPython whether the text is a valid assignment target, which is exactly the
+# question, and `(?!=)` keeps `x = y != z` out.
+_CAPTURE = re.compile(r"^(\s*)(.+?)\s*=\s*([!%])(?!=)(.*)$")
+
+
+def _capture_target(line: str):
+    """`(indent, target, operator, rest)` for an IPython capture assignment, or None."""
+    match = _CAPTURE.match(line)
+    if match is None:
+        return None
+    indent, target, operator, rest = match.groups()
+    try:
+        tree = ast.parse(f"{target} = None")
+    except (SyntaxError, ValueError):
+        return None
+    if len(tree.body) != 1 or not isinstance(tree.body[0], ast.Assign):
+        return None
+    return indent, target, operator, rest, tree.body[0].targets
 
 
 def _string_open_lines(source: str) -> frozenset:
@@ -729,9 +777,9 @@ def _neutralised(source: str) -> str:
             out.append(line)
             continuing = False
             continue
-        capture = _CAPTURE.match(line)
+        capture = _capture_target(line)
         if capture:
-            indent, target, operator, rest = capture.groups()
+            indent, target, operator, rest, _targets = capture
             magic = rest.split(maxsplit = 1)[0] if operator == "%" and rest.strip() else ""
             if magic in _CODE_MAGICS and rest.partition(" ")[2].strip():
                 # `t = %timeit -o exec(payload)` captures a result, but IPython still
@@ -742,8 +790,21 @@ def _neutralised(source: str) -> str:
                 out.append(f"{indent}{target} = {argument}")
             else:
                 # The shell or magic result is opaque, so binding None both keeps the
-                # statement parseable and correctly leaves the target untracked.
-                out.append(f"{indent}{target} = None")
+                # statement parseable and correctly clears the target.
+                #
+                # Every bound NAME is spelled out as its own target rather than
+                # reusing the original text. `payload, ignored = None` parses but is
+                # one scalar against a tuple, which nothing can pair up, so a
+                # `payload` built before the capture kept its stale reason. Chained
+                # targets bind each name to None and say exactly what happened.
+                names = sorted({
+                    child.id
+                    for node in _targets
+                    for child in ast.walk(node)
+                    if isinstance(child, ast.Name)
+                })
+                left = " = ".join(names) if names else target
+                out.append(f"{indent}{left} = None")
             continuing = line.rstrip().endswith("\\")
             continue
         if continuing:
@@ -768,6 +829,10 @@ def _neutralised(source: str) -> str:
     return "\n".join(out)
 
 
+# `%%script` options that take their value in the following token.
+_SCRIPT_VALUE_OPTIONS = ("--out", "--err", "--proc")
+
+
 def _runs_python(argument: str) -> bool:
     """Whether a `%%script` argument names a Python interpreter.
 
@@ -776,8 +841,19 @@ def _runs_python(argument: str) -> bool:
     considered, which keeps `/usr/bin/python3.13` and a bare `python` on the same
     footing.
     """
-    for token in argument.split():
+    tokens = argument.split()
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
         if token.startswith("-"):
+            # IPython documents `--out OUT`, `--err ERR` and `--proc PROC` for
+            # `%%script`, so the value sits in its own token. Skipping only the option
+            # left `captured` looking like the executable, and
+            # `%%script --out captured python` was classified as another language.
+            if token.split("=", 1)[0] in _SCRIPT_VALUE_OPTIONS and "=" not in token:
+                index += 2
+            else:
+                index += 1
             continue
         return token.rsplit("/", 1)[-1].split("\\")[-1].startswith("python")
     return False
