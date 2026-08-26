@@ -45,7 +45,12 @@ class _Response:
     A fake offering only `.text` would let either of those regress silently.
     """
 
-    def __init__(self, text, status_code = 200, headers = None):
+    def __init__(
+        self,
+        text,
+        status_code = 200,
+        headers = None,
+    ):
         self.encoding = "utf-8"
         self.status_code = status_code
         self.headers = headers or {}

@@ -59,7 +59,13 @@ class _FakeResponse:
     carry a status and headers as well as `iter_content`.
     """
 
-    def __init__(self, text, chunks = None, status_code = 200, headers = None):
+    def __init__(
+        self,
+        text,
+        chunks = None,
+        status_code = 200,
+        headers = None,
+    ):
         self.encoding = "utf-8"
         self.status_code = status_code
         self.headers = headers or {}
@@ -75,7 +81,11 @@ class _FakeResponse:
         return False
 
 
-def _install_fake_requests(monkeypatch, text, chunks = None):
+def _install_fake_requests(
+    monkeypatch,
+    text,
+    chunks = None,
+):
     module = types.ModuleType("requests")
     module.compat = types.SimpleNamespace(urljoin = lambda base, url: url)
     module.get = lambda url, timeout = None, stream = False, allow_redirects = True: (
@@ -170,8 +180,12 @@ def test_a_redirect_body_is_bounded_too(monkeypatch):
     module = types.ModuleType("requests")
     module.compat = types.SimpleNamespace(urljoin = lambda base, url: url)
     module.get = lambda url, timeout = None, stream = False, allow_redirects = True: (
-        _FakeResponse("", chunks = endless(), status_code = 302,
-                      headers = {"location": "https://example.invalid/next"})
+        _FakeResponse(
+            "",
+            chunks = endless(),
+            status_code = 302,
+            headers = {"location": "https://example.invalid/next"},
+        )
     )
     monkeypatch.setitem(sys.modules, "requests", module)
 
@@ -187,7 +201,12 @@ def test_a_redirect_loop_ends(monkeypatch):
     module = types.ModuleType("requests")
     module.compat = types.SimpleNamespace(urljoin = lambda base, url: url)
 
-    def get(url, timeout = None, stream = False, allow_redirects = True):
+    def get(
+        url,
+        timeout = None,
+        stream = False,
+        allow_redirects = True,
+    ):
         hops.append(url)
         assert len(hops) < 50, "the probe followed redirects without a hop limit"
         return _FakeResponse("", status_code = 302, headers = {"location": url})

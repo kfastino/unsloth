@@ -541,9 +541,11 @@ def _get_new_mapper():
         for _ in range(5):
             response = requests.get(url, timeout = 3, stream = True, allow_redirects = False)
             with response:
-                location = response.headers.get("location") if (
-                    300 <= response.status_code < 400
-                ) else None
+                location = (
+                    response.headers.get("location")
+                    if (300 <= response.status_code < 400)
+                    else None
+                )
                 if location is not None:
                     # A redirect body is not read at all: closing releases the
                     # connection without draining it, so an oversized or endlessly

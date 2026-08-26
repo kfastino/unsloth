@@ -86,7 +86,13 @@ class _FakeResponse:
     carry a status and headers as well as `iter_content`.
     """
 
-    def __init__(self, text, chunks = None, status_code = 200, headers = None):
+    def __init__(
+        self,
+        text,
+        chunks = None,
+        status_code = 200,
+        headers = None,
+    ):
         self.encoding = "utf-8"
         self.status_code = status_code
         self.headers = headers or {}
@@ -102,7 +108,11 @@ class _FakeResponse:
         return False
 
 
-def _install_fake_requests(monkeypatch, text, chunks = None):
+def _install_fake_requests(
+    monkeypatch,
+    text,
+    chunks = None,
+):
     module = types.ModuleType("requests")
     module.compat = types.SimpleNamespace(urljoin = lambda base, url: url)
     module.get = lambda url, timeout = None, stream = False, allow_redirects = True: (
