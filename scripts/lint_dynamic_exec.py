@@ -324,8 +324,11 @@ class _Visitor(ast.NodeVisitor):
         parts.extend(d for d in args.kw_defaults if d is not None)
         if not self.annotations_deferred:
             for arg in (
-                *args.posonlyargs, *args.args, *args.kwonlyargs,
-                args.vararg, args.kwarg,
+                *args.posonlyargs,
+                *args.args,
+                *args.kwonlyargs,
+                args.vararg,
+                args.kwarg,
             ):
                 if arg is not None and arg.annotation is not None:
                     parts.append(arg.annotation)
@@ -339,9 +342,7 @@ class _Visitor(ast.NodeVisitor):
             self.visit(part)
 
         self.scope.append(node.name)
-        self.scope_kinds.append(
-            "class" if isinstance(node, ast.ClassDef) else "function"
-        )
+        self.scope_kinds.append("class" if isinstance(node, ast.ClassDef) else "function")
         # A fresh scope: a name built in one function says nothing about the same name
         # in another.
         self.tainted.append({})
@@ -563,8 +564,7 @@ class _Visitor(ast.NodeVisitor):
             self.visit(default)
         shadowed = {
             arg.arg
-            for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs,
-                        args.vararg, args.kwarg)
+            for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs, args.vararg, args.kwarg)
             if arg is not None
         }
         saved = {name: self.tainted[-1].pop(name) for name in shadowed if name in self.tainted[-1]}
@@ -797,12 +797,14 @@ def _neutralised(source: str) -> str:
                 # one scalar against a tuple, which nothing can pair up, so a
                 # `payload` built before the capture kept its stale reason. Chained
                 # targets bind each name to None and say exactly what happened.
-                names = sorted({
-                    child.id
-                    for node in _targets
-                    for child in ast.walk(node)
-                    if isinstance(child, ast.Name)
-                })
+                names = sorted(
+                    {
+                        child.id
+                        for node in _targets
+                        for child in ast.walk(node)
+                        if isinstance(child, ast.Name)
+                    }
+                )
                 left = " = ".join(names) if names else target
                 out.append(f"{indent}{left} = None")
             continuing = line.rstrip().endswith("\\")

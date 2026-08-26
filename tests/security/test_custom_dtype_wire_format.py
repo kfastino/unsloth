@@ -67,12 +67,12 @@ def test_zoo_reader_still_parses_what_unsloth_writes():
     import unsloth_zoo.compiler as zoo_compiler
 
     source = pathlib.Path(zoo_compiler.__file__).read_text(encoding = "utf-8")
-    assert 'custom_datatype.count(";") >= 4' in source, (
-        "unsloth_zoo changed how it validates UNSLOTH_FORCE_CUSTOM_DTYPE"
-    )
-    assert 'custom_datatype.split(";", 4)' in source, (
-        "unsloth_zoo changed the field split for UNSLOTH_FORCE_CUSTOM_DTYPE"
-    )
+    assert (
+        'custom_datatype.count(";") >= 4' in source
+    ), "unsloth_zoo changed how it validates UNSLOTH_FORCE_CUSTOM_DTYPE"
+    assert (
+        'custom_datatype.split(";", 4)' in source
+    ), "unsloth_zoo changed the field split for UNSLOTH_FORCE_CUSTOM_DTYPE"
 
     from unsloth_zoo.utils import _get_dtype
 

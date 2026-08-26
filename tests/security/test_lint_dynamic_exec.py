@@ -48,9 +48,9 @@ def test_self_test_passes():
 def test_live_tree_passes():
     """Every interpolated dynamic-execution call in the tree is reviewed."""
     proc = _run()
-    assert proc.returncode == 0, (
-        f"the live tree fails the lint:\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
-    )
+    assert (
+        proc.returncode == 0
+    ), f"the live tree fails the lint:\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
 
 
 # --- the lint actually catches things ----------------------------------------
