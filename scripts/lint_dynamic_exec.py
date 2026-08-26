@@ -105,22 +105,9 @@ _CONVERSIONS = ("encode", "decode")
 # content survives all of them, so `exec(f" import {name}".strip())` executes exactly
 # what the f-string built and the outer call must not read as clean.
 _NORMALISERS = (
-    "strip",
-    "lstrip",
-    "rstrip",
-    "upper",
-    "lower",
-    "title",
-    "capitalize",
-    "casefold",
-    "swapcase",
-    "expandtabs",
-    "removeprefix",
-    "removesuffix",
-    "center",
-    "ljust",
-    "rjust",
-    "zfill",
+    "strip", "lstrip", "rstrip", "upper", "lower", "title", "capitalize",
+    "casefold", "swapcase", "expandtabs", "removeprefix", "removesuffix",
+    "center", "ljust", "rjust", "zfill",
 )
 
 # Constructors that hand the same source on in another type. Same argument as
@@ -134,10 +121,8 @@ _CONSTRUCTORS = ("bytes", "bytearray", "str", "memoryview")
 # `bytes(source = ..., encoding = ...)` and `str(object = ...)` both build the same
 # value a positional call would, so reading only `args[0]` missed them.
 _CONSTRUCTOR_SOURCE_KEYWORD = {
-    "bytes": "source",
-    "bytearray": "source",
-    "str": "object",
-    "memoryview": "object",
+    "bytes": "source", "bytearray": "source",
+    "str": "object", "memoryview": "object",
 }
 
 
@@ -172,22 +157,28 @@ def _constructor_source(node: ast.Call, name: str) -> ast.AST | None:
     return None
 
 
-def _literal_element(
-    node: ast.Subscript,
-    resolve = None,
-    shadowed = None,
-) -> str | None:
+def _literal_element(node: ast.Subscript, resolve = None, shadowed = None) -> str | None:
     """The reason for `<literal>[<constant>]`, or None when it is not that shape."""
     container, index = node.value, node.slice
-    if not isinstance(index, ast.Constant):
-        return None
     if isinstance(container, (ast.Tuple, ast.List)):
-        if not isinstance(index.value, int) or isinstance(index.value, bool):
+        # A negative literal index is `UnaryOp(USub, Constant(1))`, not a `Constant`,
+        # so requiring a constant rejected `[...][-1]` before the container was even
+        # looked at and the last element - the one that runs - went unread.
+        position = index
+        sign = 1
+        if isinstance(position, ast.UnaryOp) and isinstance(position.op, (ast.USub, ast.UAdd)):
+            sign = -1 if isinstance(position.op, ast.USub) else 1
+            position = position.operand
+        if not isinstance(position, ast.Constant):
+            return None
+        if not isinstance(position.value, int) or isinstance(position.value, bool):
             return None
         try:
-            return _is_interpolated(container.elts[index.value], resolve, shadowed)
+            return _is_interpolated(container.elts[sign * position.value], resolve, shadowed)
         except IndexError:
             return None
+    if not isinstance(index, ast.Constant):
+        return None
     if isinstance(container, ast.Dict):
         # Last one wins, as it does at runtime, so the scan runs from the end.
         for key, value in zip(reversed(container.keys), reversed(container.values)):
@@ -196,11 +187,7 @@ def _literal_element(
     return None
 
 
-def _is_interpolated(
-    node: ast.AST,
-    resolve = None,
-    shadowed = None,
-) -> str | None:
+def _is_interpolated(node: ast.AST, resolve = None, shadowed = None) -> str | None:
     """Returns why `node` is a built string, or None if it is not one.
 
     `resolve` maps a bare name to the reason it is tainted, or None. It is passed
@@ -247,9 +234,7 @@ def _is_interpolated(
     if isinstance(node, ast.IfExp):
         # `exec(f"import {name}" if flag else "import os")` executes whichever branch
         # is taken, so either one being built is enough.
-        return _is_interpolated(node.body, resolve, shadowed) or _is_interpolated(
-            node.orelse, resolve, shadowed
-        )
+        return _is_interpolated(node.body, resolve, shadowed) or _is_interpolated(node.orelse, resolve, shadowed)
     if isinstance(node, ast.JoinedStr):
         # An f-string with no placeholders is just a literal.
         if any(isinstance(v, ast.FormattedValue) for v in node.values):
@@ -274,7 +259,10 @@ def _is_interpolated(
                 # `str.encode(s)` and `builtins.str.encode(s)` alike: the receiver
                 # names the type, so the source is the first argument.
                 if _constructor_name(function.value, shadowed) is not None:
-                    return _is_interpolated(node.args[0], resolve, shadowed) if node.args else None
+                    return (
+                        _is_interpolated(node.args[0], resolve, shadowed)
+                        if node.args else None
+                    )
                 # Unwrap the receiver: the conversion changes the type, not the syntax.
                 return _is_interpolated(function.value, resolve, shadowed)
         constructor = _constructor_name(function, shadowed)
@@ -447,6 +435,10 @@ class _Visitor(ast.NodeVisitor):
         self.sink_aliases: list[dict[str, str]] = [{}]
         # Sink names this file rebound to something else, e.g. `from re import compile`.
         self.shadowed_sinks: list[set[str]] = [set()]
+        # One entry per scope pushed by `_enter`: the enclosing binding state to
+        # restore when a deferred function body is finished with, or None for a class
+        # body, which runs in place and keeps what it writes.
+        self.deferred_state: list = []
         # Names this scope declared `global`, so a rebinding of one updates the module
         # rather than a fresh function-level entry that the outer state then outvotes.
         self.global_names: list[set[str]] = [set()]
@@ -486,9 +478,7 @@ class _Visitor(ast.NodeVisitor):
     def _alias(self, name: str) -> str | None:
         """The sink `name` resolves to through an import, innermost scope first."""
         for index in self._visible_scopes():
-            table = (
-                self.sink_aliases if index == len(self.sink_aliases) - 1 else self.collected_aliases
-            )
+            table = self.sink_aliases if index == len(self.sink_aliases) - 1 else self.collected_aliases
             if name in table[index]:
                 return table[index][name]
         return None
@@ -505,9 +495,7 @@ class _Visitor(ast.NodeVisitor):
         for index in self._visible_scopes():
             if name in self.shadowed_sinks[index]:
                 return True
-            table = (
-                self.sink_aliases if index == len(self.sink_aliases) - 1 else self.collected_aliases
-            )
+            table = self.sink_aliases if index == len(self.sink_aliases) - 1 else self.collected_aliases
             if name in table[index]:
                 return False
         return False
@@ -542,11 +530,8 @@ class _Visitor(ast.NodeVisitor):
         parts.extend(d for d in args.kw_defaults if d is not None)
         if not self.annotations_deferred:
             for arg in (
-                *args.posonlyargs,
-                *args.args,
-                *args.kwonlyargs,
-                args.vararg,
-                args.kwarg,
+                *args.posonlyargs, *args.args, *args.kwonlyargs,
+                args.vararg, args.kwarg,
             ):
                 if arg is not None and arg.annotation is not None:
                     parts.append(arg.annotation)
@@ -559,13 +544,40 @@ class _Visitor(ast.NodeVisitor):
         for part in self._outer_parts(node):
             self.visit(part)
 
+        # A function body is DEFERRED: it may never run, so what it binds through
+        # `global` or `nonlocal` must not be recorded in the enclosing scopes while the
+        # definition is merely being scanned. `def configure(): global exec; exec = print`
+        # left a module-level shadow that suppressed a real call at module level.
+        # Class bodies are the opposite - they run in place - so they keep their writes.
+        if not isinstance(node, ast.ClassDef):
+            self.deferred_state.append((
+                [set(level) for level in self.shadowed_sinks],
+                [dict(level) for level in self.sink_aliases],
+                [dict(level) for level in self.collected_aliases],
+            ))
+        else:
+            self.deferred_state.append(None)
+
+        # Defaults are evaluated out here, in the scope the `def` is written in, so
+        # they have to be classified before the new scope is pushed. Doing it after
+        # meant `_visible_scopes` was already skipping the class level, and
+        # `class C: from re import compile` followed by `def f(self, compile=compile)`
+        # read the default as the builtin when it is `re.compile`.
+        outer_defaults = (
+            {} if isinstance(node, ast.ClassDef) else self._sink_defaults(node.args)
+        )
+
         self.scope.append(node.name)
-        self.scope_kinds.append("class" if isinstance(node, ast.ClassDef) else "function")
+        self.scope_kinds.append(
+            "class" if isinstance(node, ast.ClassDef) else "function"
+        )
         # A fresh scope: a name built in one function says nothing about the same name
         # in another. A class body is the exception - it runs immediately, in place,
         # so `payload = f"import {name}"` above `class C: exec(payload)` really is
         # executed and the map carries over.
-        self.tainted.append(dict(self.tainted[-1]) if isinstance(node, ast.ClassDef) else {})
+        self.tainted.append(
+            dict(self.tainted[-1]) if isinstance(node, ast.ClassDef) else {}
+        )
         # Aliases are lexical too: a `from builtins import exec as run` inside one
         # function said nothing about a `run` parameter in the next one. Parameters
         # shadow, so they are recorded as rebindings for this scope.
@@ -576,13 +588,10 @@ class _Visitor(ast.NodeVisitor):
         self.nonlocal_names.append(set())
         if not isinstance(node, ast.ClassDef):
             arguments = node.args
-            defaults = self._sink_defaults(arguments)
+            defaults = outer_defaults
             for argument in (
-                *arguments.posonlyargs,
-                *arguments.args,
-                *arguments.kwonlyargs,
-                arguments.vararg,
-                arguments.kwarg,
+                *arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs,
+                arguments.vararg, arguments.kwarg,
             ):
                 if argument is None:
                     continue
@@ -609,6 +618,15 @@ class _Visitor(ast.NodeVisitor):
         self.tainted.pop()
         self.scope.pop()
         self.scope_kinds.pop()
+        saved_deferred = self.deferred_state.pop()
+        if saved_deferred is not None:
+            # Roll the enclosing scopes back to what they were before the definition
+            # was scanned. Binding the `def`'s own name, just below, is the only thing
+            # the statement really does out here.
+            shadows, sinks, collected = saved_deferred
+            self.shadowed_sinks[:] = shadows
+            self.sink_aliases[:] = sinks
+            self.collected_aliases[:] = collected
         # The statement ends by binding its own name out here, to a function or a
         # class. Leaving the old entry in place reported
         # `payload = f"import {user}"; def payload(): pass; exec(payload)`, where the
@@ -735,14 +753,26 @@ class _Visitor(ast.NodeVisitor):
             self.tainted[-1].update(aggregated)
         self.visit(node.target)
         # `for exec in callbacks:` calls the callback in the body, not the builtin.
-        names = {child.id for child in ast.walk(node.target) if isinstance(child, ast.Name)}
+        # Store context only: in `for table[exec] in ...` the `exec` is a subscript key
+        # that is merely READ, so treating it as bound shadowed the sink for the body.
+        names = {
+            child.id for child in ast.walk(node.target)
+            if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store)
+        }
         saved_scope = self._shadow_locals(self._sink_valued(names, node.target, node.iter))
         for statement in node.body:
             self.visit(statement)
         # The `else` suite also runs when the iterable was empty, in which case the
         # target was never bound and the name still means whatever it meant outside -
         # `for exec in []: pass` leaves `exec` as the builtin.
-        self._restore_locals(saved_scope)
+        #
+        # A visibly nonempty literal is the opposite: the loop necessarily ran, so the
+        # target keeps whatever the last element gave it. `exec = print` then
+        # `for exec in [builtins.exec]: pass` leaves `exec` as the builtin, and
+        # restoring the pre-loop shadow suppressed the call that follows. Only this
+        # shape, where every element is written out in the source.
+        if not (isinstance(node.iter, (ast.Tuple, ast.List)) and node.iter.elts):
+            self._restore_locals(saved_scope)
         for statement in node.orelse:
             self.visit(statement)
 
@@ -760,13 +790,22 @@ class _Visitor(ast.NodeVisitor):
         """
         self.visit(node.subject)
         reason = _is_interpolated(node.subject, self.tainted[-1].get)
+        subject_sink = _sink_name(node.subject, self._alias) is not None
         for case in node.cases:
             bound = [name for name, _ in _pattern_bindings(case.pattern)]
-            saved_scope = self._shadow_locals(bound)
+            # `match builtins.exec: case exec:` binds the builtin back to its own
+            # spelling, the same way `for exec in [builtins.exec]` does, so shadowing
+            # the captured name unconditionally hid the call in the body. Only a
+            # whole-subject capture, where the value is the subject itself.
+            shadow = {
+                name: subject_sink and captures_subject
+                for name, captures_subject in _pattern_bindings(case.pattern)
+            }
+            saved_scope = self._shadow_locals(shadow if subject_sink else bound)
             for name, captures_subject in _pattern_bindings(case.pattern):
-                self.tainted[-1][name] = (
-                    f"{reason} via `{name}`" if (reason is not None and captures_subject) else None
-                )
+                self.tainted[-1][name] = f"{reason} via `{name}`" if (
+                    reason is not None and captures_subject
+                ) else None
                 if self.tainted[-1][name] is None:
                     self.tainted[-1].pop(name, None)
             if case.guard is not None:
@@ -880,6 +919,10 @@ class _Visitor(ast.NodeVisitor):
         """
         self.generic_visit(node)
         self._bind(node.target, _is_interpolated(node.value))
+        # `(exec := builtins.exec)` hands the builtin back to its own spelling exactly
+        # as the statement form does, and only the taint map was being updated, so an
+        # earlier `exec = print` shadow survived and suppressed the real call.
+        self._shadow_assignment(node.target, node.value)
 
     def _annotation_executes(self) -> bool:
         """Whether an annotation in the current scope is evaluated at runtime.
@@ -984,7 +1027,8 @@ class _Visitor(ast.NodeVisitor):
                 # `run` print inside `inner`. Recorded as a shadow rather than a value,
                 # since what it becomes is not this checker's business.
                 targets = (
-                    statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+                    statement.targets if isinstance(statement, ast.Assign)
+                    else [statement.target]
                 )
                 for target in targets:
                     for child in ast.walk(target):
@@ -1027,6 +1071,8 @@ class _Visitor(ast.NodeVisitor):
                 self.shadowed_sinks[-1].discard(bound)
             else:
                 self.tainted[-1].pop(bound, None)
+                # `from helper import str` binds the application's object, not the
+                # constructor, so the name stops being one of ours.
                 self._shadow_sink(bound)
         self.generic_visit(node)
 
@@ -1041,14 +1087,21 @@ class _Visitor(ast.NodeVisitor):
         for alias in node.names:
             bound = alias.asname or alias.name.split(".")[0]
             self.tainted[-1].pop(bound, None)
-            if alias.name == "builtins" and alias.asname:
+            if alias.name == "builtins":
                 # This import IS the builtins binding, so it must register rather than
                 # shadow; clearing first and registering after wiped it out.
                 self._shadow_sink(bound)
                 # Both tables, since `_shadow_sink` clears both and a nested scope
-                # reads `collected_aliases`.
+                # reads `collected_aliases`. `bound` is `builtins` itself for the
+                # plain `import builtins`, which must register here rather than fall
+                # through to the shadow branch now that `builtins` is a name the
+                # checker recognises.
                 self.sink_aliases[-1][f"module:{bound}"] = "builtins"
                 self.collected_aliases[-1][f"module:{bound}"] = "builtins"
+                # `builtins` is itself one of the names the checker recognises, so the
+                # clearing above now records a shadow for it. This import is the real
+                # binding, so that shadow has to come straight back off.
+                self.shadowed_sinks[-1].discard(bound)
             else:
                 self._shadow_sink(bound)
         self.generic_visit(node)
@@ -1075,6 +1128,24 @@ class _Visitor(ast.NodeVisitor):
             or self._is_shadowed(name)
         )
 
+    def _default_is_sink(self, default) -> bool:
+        """Whether a parameter default is visibly the builtin, in the scope it runs in.
+
+        Spelling alone is not the test. A default is evaluated where the `def` is
+        written, so `class C: from re import compile` above
+        `def f(self, compile = compile)` supplies `re.compile`, and reading the name as
+        the builtin left the parameter unshadowed - then method lookup correctly
+        skipped the class namespace and the body was reported as calling the builtin.
+        """
+        if _sink_name(default, self._alias) is None:
+            return False
+        root = default
+        while isinstance(root, ast.Attribute):
+            root = root.value
+        if isinstance(root, ast.Name) and self._is_shadowed(root.id):
+            return False
+        return True
+
     def _sink_defaults(self, arguments) -> dict:
         """`{parameter: whether its default is visibly a sink}`.
 
@@ -1083,13 +1154,12 @@ class _Visitor(ast.NodeVisitor):
         """
         answer: dict = {}
         positional = [*arguments.posonlyargs, *arguments.args]
-        for argument, default in zip(
-            positional[len(positional) - len(arguments.defaults) :], arguments.defaults
-        ):
-            answer[argument.arg] = _sink_name(default, self._alias) is not None
+        for argument, default in zip(positional[len(positional) - len(arguments.defaults):],
+                                     arguments.defaults):
+            answer[argument.arg] = self._default_is_sink(default)
         for argument, default in zip(arguments.kwonlyargs, arguments.kw_defaults):
             if default is not None:
-                answer[argument.arg] = _sink_name(default, self._alias) is not None
+                answer[argument.arg] = self._default_is_sink(default)
         return answer
 
     def _sink_valued(self, names, target, iterable) -> dict:
@@ -1126,6 +1196,12 @@ class _Visitor(ast.NodeVisitor):
             if names.get(name) if isinstance(names, dict) else False:
                 # The binding is visibly the builtin itself, so it is not shadowed:
                 # `for exec in [builtins.exec]` really does call `exec` in the body.
+                # Actively undone rather than merely skipped, because an earlier
+                # `exec = print` in this scope had already recorded a shadow and
+                # lookup would have found that one instead.
+                self.shadowed_sinks[-1].discard(name)
+                if name in SINKS:
+                    self.sink_aliases[-1][name] = name
                 continue
             if self._binds_over_sink(name):
                 self.shadowed_sinks[-1].add(name)
@@ -1175,7 +1251,8 @@ class _Visitor(ast.NodeVisitor):
             # where the value each target receives is readable without running it.
             if isinstance(value, (ast.Tuple, ast.List)) and len(target.elts) == len(value.elts):
                 if not any(
-                    isinstance(element, ast.Starred) for element in (*target.elts, *value.elts)
+                    isinstance(element, ast.Starred)
+                    for element in (*target.elts, *value.elts)
                 ):
                     for sub_target, sub_value in zip(target.elts, value.elts):
                         self._shadow_assignment(sub_target, sub_value)
@@ -1194,13 +1271,17 @@ class _Visitor(ast.NodeVisitor):
             # module level, where the earlier `exec = print` shadow lives.
             level = self._binding_level(target.id)
             self.shadowed_sinks[level].discard(target.id)
-            if target.id not in SINKS:
-                # `run = print` then `run = builtins.exec` has to make `run` an alias
-                # again; dropping the shadow alone left it resolving to nothing,
-                # because the first assignment had already removed the alias entry.
-                sink = resolved.rpartition(".")[2]
-                self.sink_aliases[level][target.id] = sink
-                self.collected_aliases[level][target.id] = sink
+            # `run = print` then `run = builtins.exec` has to make `run` an alias
+            # again; dropping the shadow alone left it resolving to nothing, because
+            # the first assignment had already removed the alias entry.
+            #
+            # Recorded for the builtin spellings too. Dropping the shadow only clears
+            # THIS level, and lookup walks outward, so `exec = print` at module level
+            # followed by `(exec := builtins.exec)` inside a function still found the
+            # module shadow. An entry at the binding level makes the inner one win.
+            sink = resolved.rpartition(".")[2]
+            self.sink_aliases[level][target.id] = sink
+            self.collected_aliases[level][target.id] = sink
             return
         level = self._binding_level(target.id)
         self.shadowed_sinks[level].add(target.id)
@@ -1216,7 +1297,12 @@ class _Visitor(ast.NodeVisitor):
         states are honoured, and `builtins.compile(...)` is unaffected because it names
         the builtin explicitly rather than through the shadowed name.
         """
-        if name in SINKS:
+        if name in _BUILTIN_NAMES:
+            # Every name this checker relies on, not just the three sinks. It unwraps
+            # `str(...)` and `bytes(...)` as conversions and resolves `builtins.exec`
+            # through the module name, so `from helper import str` and
+            # `import helper as builtins` have to take those away too - otherwise the
+            # gate fails on code that never touches a builtin at all.
             self.shadowed_sinks[-1].add(name)
         # Both tables: `sink_aliases` is what the current scope has executed, and
         # `collected_aliases` is what a nested scope sees, so leaving the name in the
@@ -1253,7 +1339,8 @@ class _Visitor(ast.NodeVisitor):
         defaults = self._sink_defaults(args)
         shadowed = {
             arg.arg
-            for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs, args.vararg, args.kwarg)
+            for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs,
+                        args.vararg, args.kwarg)
             if arg is not None and not defaults.get(arg.arg)
         }
         saved = dict(self.tainted[-1])
@@ -1310,22 +1397,20 @@ class _Visitor(ast.NodeVisitor):
             child.id
             for generator in generators
             for child in ast.walk(generator.target)
-            if isinstance(child, ast.Name)
+            if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store)
         }
         saved = dict(self.tainted[-1])
         sink_valued: dict = {}
         for generator in generators:
-            sink_valued.update(
-                self._sink_valued(
-                    {
-                        child.id
-                        for child in ast.walk(generator.target)
-                        if isinstance(child, ast.Name)
-                    },
-                    generator.target,
-                    generator.iter,
-                )
-            )
+            sink_valued.update(self._sink_valued(
+                {
+                    child.id
+                    for child in ast.walk(generator.target)
+                    if isinstance(child, ast.Name)
+                },
+                generator.target,
+                generator.iter,
+            ))
         if self.scope_kinds[-1] == "class":
             # Same as the lambda: a comprehension in a class body cannot see class
             # locals - but it does see whatever encloses the class.
@@ -1338,14 +1423,16 @@ class _Visitor(ast.NodeVisitor):
         self.shadowed_sinks.append(set())
         self.global_names.append(set())
         self.nonlocal_names.append(set())
-        # Installed AFTER the push, so the shadow lands in the comprehension's own
-        # scope. Recording it in the enclosing one was invisible from the body when
+        # Shadows are installed AFTER the push, so they land in the comprehension's own
+        # scope. Recording them in the enclosing one was invisible from the body when
         # that scope was a class body, because `_visible_scopes` skips class levels
-        # when looking outward - `[exec(...) for exec in ...]` in a class body still
-        # resolved to the builtin. Popping the scope drops it, so there is nothing to
+        # when looking outward. Popping the scope drops them, so there is nothing to
         # hand back.
-        self._shadow_locals({**{n: False for n in targets}, **sink_valued})
-
+        #
+        # And one generator at a time, after its own iterable has been visited. The
+        # outermost iterable is evaluated before ANY target is bound, so shadowing
+        # every target up front made `[None for exec in [exec(f"import {name}")]]`
+        # report nothing even though the call in the iterable really is the builtin.
         for index, generator in enumerate(generators):
             if not index:
                 # The outermost iterable is evaluated in the ENCLOSING state, before
@@ -1358,8 +1445,13 @@ class _Visitor(ast.NodeVisitor):
                 # after the earlier targets are.
                 self.visit(generator.iter)
             names = {
-                child.id for child in ast.walk(generator.target) if isinstance(child, ast.Name)
+                child.id
+                for child in ast.walk(generator.target)
+                if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store)
             }
+            self._shadow_locals({
+                name: sink_valued.get(name, False) for name in names
+            })
             for name in names:
                 self.tainted[-1].pop(name, None)
             if isinstance(generator.iter, (ast.Tuple, ast.List)) and generator.iter.elts:
@@ -1473,7 +1565,8 @@ def _notebook_code_cells(path: Path) -> list[tuple[int, str]]:
         ) from None
     if not isinstance(document, dict) or not isinstance(document.get("cells", []), list):
         raise ScanError(
-            f"{_relative(path)}: is not a notebook document, so its code cells were " f"not checked"
+            f"{_relative(path)}: is not a notebook document, so its code cells were "
+            f"not checked"
         )
     cells = []
     for index, cell in enumerate(document.get("cells", [])):
@@ -1583,7 +1676,7 @@ def _capture_target(line: str):
             continue
         if len(tree.body) != 1 or not isinstance(tree.body[0], ast.Assign):
             continue
-        return indent, target, operator, line[match.end() :], tree.body[0].targets
+        return indent, target, operator, line[match.end():], tree.body[0].targets
     return None
 
 
@@ -1707,14 +1800,13 @@ def _neutralised(source: str) -> str:
                 # Store context only. `outputs[payload] = !cmd` READS `payload` to
                 # index with; it does not rebind it, and clearing it there turned this
                 # cleanup into a bypass.
-                names = sorted(
-                    {
-                        child.id
-                        for node in _targets
-                        for child in ast.walk(node)
-                        if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store)
-                    }
-                )
+                names = sorted({
+                    child.id
+                    for node in _targets
+                    for child in ast.walk(node)
+                    if isinstance(child, ast.Name)
+                    and isinstance(child.ctx, ast.Store)
+                })
                 # A target that is not a plain name is KEPT rather than dropped:
                 # `result = outputs[exec(payload)] = !cmd` still evaluates the
                 # subscript, so replacing the whole chain with `result = None` threw
@@ -1744,7 +1836,11 @@ def _neutralised(source: str) -> str:
         stripped = line.lstrip()
         automagic = stripped.split(maxsplit = 1)[0] if stripped else ""
         remainder = stripped.split(maxsplit = 1)
-        if automagic in _CODE_MAGICS and len(remainder) > 1 and not stripped.startswith(("%", "!")):
+        if (
+            automagic in _CODE_MAGICS
+            and len(remainder) > 1
+            and not stripped.startswith(("%", "!"))
+        ):
             # IPython's automagic lets `timeit exec(payload)` run the sink without a
             # leading `%`. The raw cell does not parse and nothing here rewrote the
             # line, so the cell was skipped along with the sink. Only rewritten when
@@ -1795,7 +1891,7 @@ def _neutralised(source: str) -> str:
                         consumed += 1
                         if not piece.endswith("\\"):
                             break
-                    argument = _magic_argument(" ".join(joined).lstrip()[len(magic) + 1 :])
+                    argument = _magic_argument(" ".join(joined).lstrip()[len(magic) + 1:])
                     out.append(indent + argument)
                     out.extend([""] * (consumed - 1))
                     skip = consumed - 1
@@ -1874,10 +1970,8 @@ def _runs_python(argument: str) -> bool:
                 if name in ("-S", "--split-string"):
                     # `env -S "python -u"` puts the whole command in one argument, so
                     # the wrapped command is inside that value rather than after it.
-                    value = (
-                        token.split("=", 1)[1]
-                        if "=" in token
-                        else (tokens[index + 1] if index + 1 < len(tokens) else "")
+                    value = token.split("=", 1)[1] if "=" in token else (
+                        tokens[index + 1] if index + 1 < len(tokens) else ""
                     )
                     return _runs_python(value)
                 if name in _ENV_VALUE_OPTIONS and "=" not in token:
@@ -1892,7 +1986,7 @@ def _runs_python(argument: str) -> bool:
         # script name, a `-c` command or a `-m` module it runs that instead and the
         # body is just data piped at it, so scanning it reported findings in text that
         # is never executed as Python here.
-        rest = tokens[index + 1 :]
+        rest = tokens[index + 1:]
         position = 0
         while position < len(rest):
             token = rest[position]
@@ -2014,7 +2108,9 @@ def _scan_notebook(path: Path) -> list[dict]:
         try:
             visitor.visit(tree)
         except RecursionError:
-            raise ScanError(f"{_relative(path)}#cell{index}: too deeply nested to walk") from None
+            raise ScanError(
+                f"{_relative(path)}#cell{index}: too deeply nested to walk"
+            ) from None
     if skipped:
         NOTEBOOK_SKIPPED.append((_relative(path), skipped))
     return visitor.findings
@@ -2116,8 +2212,7 @@ def collect_paths(targets: list[str]) -> tuple[list[Path], list[str]]:
             before = len(paths)
             for pattern in ("*.py", f"*{NOTEBOOK_SUFFIX}"):
                 paths.extend(
-                    p
-                    for p in root.rglob(pattern)
+                    p for p in root.rglob(pattern)
                     if p.is_file() and not _EXCLUDED_PARTS & set(_exclusion_parts(p, root))
                 )
             if len(paths) == before:
@@ -2143,24 +2238,11 @@ def collect_paths(targets: list[str]) -> tuple[list[Path], list[str]]:
 # carries third-party and generated Python that this gate has no business failing on,
 # and `--update` would otherwise write allowlist entries for files a clean CI checkout
 # does not even have.
-_EXCLUDED_PARTS = frozenset(
-    {
-        "tests",
-        "node_modules",
-        "build",
-        "dist",
-        ".venv",
-        "venv",
-        "site-packages",
-        ".git",
-        ".tox",
-        ".mypy_cache",
-        ".pytest_cache",
-        "__pycache__",
-        ".ipynb_checkpoints",
-        ".eggs",
-    }
-)
+_EXCLUDED_PARTS = frozenset({
+    "tests", "node_modules", "build", "dist", ".venv", "venv", "site-packages",
+    ".git", ".tox", ".mypy_cache", ".pytest_cache", "__pycache__", ".ipynb_checkpoints",
+    ".eggs",
+})
 
 
 def _exclusion_parts(path: Path, root: Path) -> tuple[str, ...]:
@@ -2376,7 +2458,9 @@ def self_test() -> int:
         # An AST too deep to walk must fail the gate, not report the file clean.
         deep = Path(directory) / "deep.py"
         deep.write_text(
-            "def f(user):\n    x = " + "not " * 500 + "True\n" '    exec(f"import {user}")\n'
+            "def f(user):\n"
+            "    x = " + "not " * 500 + "True\n"
+            '    exec(f"import {user}")\n'
         )
         try:
             scan_file(deep)
@@ -2452,37 +2536,20 @@ def self_test() -> int:
         # A notebook's cells share one namespace, and a `%`-leading continuation of a
         # modulo expression is not a magic.
         import json as _json
-
         def _nb(cells):
-            return _json.dumps(
-                {
-                    "cells": [{"cell_type": "code", "source": c} for c in cells],
-                    "metadata": {},
-                    "nbformat": 4,
-                    "nbformat_minor": 5,
-                }
-            )
-
+            return _json.dumps({
+                "cells": [{"cell_type": "code", "source": c} for c in cells],
+                "metadata": {}, "nbformat": 4, "nbformat_minor": 5,
+            })
         for name, cells in (
             # payload built in one cell, executed in the next
-            (
-                "cross.ipynb",
-                [['name = "os"\n', 'payload = f"import {name}"\n'], ["exec(payload)\n"]],
-            ),
+            ("cross.ipynb", [['name = "os"\n', 'payload = f"import {name}"\n'],
+                             ["exec(payload)\n"]]),
             # a continuation line starting with `%` is modulo, not a magic
             ("modulo.ipynb", [['name = "os"\n', 'exec("import %s"\n', "     % name)\n"]]),
             # ordinary Python after a multi-line shell command must still be read
-            (
-                "mixed.ipynb",
-                [
-                    [
-                        "!pip install x \\\n",
-                        "  --quiet\n",
-                        'name = "os"\n',
-                        'exec(f"import {name}")\n',
-                    ]
-                ],
-            ),
+            ("mixed.ipynb", [["!pip install x \\\n", "  --quiet\n",
+                              'name = "os"\n', 'exec(f"import {name}")\n']]),
         ):
             notebook = Path(directory) / name
             notebook.write_text(_nb(cells))
@@ -2538,14 +2605,24 @@ def main() -> int:
     errors += missing
 
     if args.update:
+        # `--update` REPLACES the file, so it may only ever run over the full tree.
+        # With `--paths` it wrote just that subset and silently dropped every reviewed
+        # entry outside it - updating one temporary offender replaced a 37 entry
+        # allowlist with a one entry file, and the justifications were only
+        # recoverable from git.
+        if args.paths:
+            print(
+                "FAIL: --update rewrites the whole allowlist and cannot be combined "
+                "with --paths, which would drop every entry outside the subset.\n"
+                "Run --update with no --paths to rewrite from the full tree.",
+                file = sys.stderr,
+            )
+            return 1
         # An allowlist written from an incomplete scan would bake in the gap.
         if errors:
             for error in errors:
                 print(f"scan error: {error}", file = sys.stderr)
-            print(
-                "\nFAIL: refusing to rewrite the allowlist from an incomplete scan.",
-                file = sys.stderr,
-            )
+            print("\nFAIL: refusing to rewrite the allowlist from an incomplete scan.", file = sys.stderr)
             return 1
         write_allowlist(findings, reason = "REVIEW ME")
         print(f"wrote {len(findings)} entries to {ALLOWLIST_PATH.name}")
