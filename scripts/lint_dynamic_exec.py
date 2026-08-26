@@ -158,11 +158,7 @@ def _constructor_source(node: ast.Call, name: str) -> ast.AST | None:
     return None
 
 
-def _literal_element(
-    node: ast.Subscript,
-    resolve = None,
-    shadowed = None,
-) -> str | None:
+def _literal_element(node: ast.Subscript, resolve = None, shadowed = None) -> str | None:
     """The reason for `<literal>[<constant>]`, or None when it is not that shape."""
     container, index = node.value, node.slice
     if not isinstance(index, ast.Constant):
@@ -175,17 +171,14 @@ def _literal_element(
         except IndexError:
             return None
     if isinstance(container, ast.Dict):
-        for key, value in zip(container.keys, container.values):
+        # Last one wins, as it does at runtime, so the scan runs from the end.
+        for key, value in zip(reversed(container.keys), reversed(container.values)):
             if isinstance(key, ast.Constant) and key.value == index.value:
                 return _is_interpolated(value, resolve, shadowed)
     return None
 
 
-def _is_interpolated(
-    node: ast.AST,
-    resolve = None,
-    shadowed = None,
-) -> str | None:
+def _is_interpolated(node: ast.AST, resolve = None, shadowed = None) -> str | None:
     """Returns why `node` is a built string, or None if it is not one.
 
     `resolve` maps a bare name to the reason it is tainted, or None. It is passed
@@ -232,9 +225,7 @@ def _is_interpolated(
     if isinstance(node, ast.IfExp):
         # `exec(f"import {name}" if flag else "import os")` executes whichever branch
         # is taken, so either one being built is enough.
-        return _is_interpolated(node.body, resolve, shadowed) or _is_interpolated(
-            node.orelse, resolve, shadowed
-        )
+        return _is_interpolated(node.body, resolve, shadowed) or _is_interpolated(node.orelse, resolve, shadowed)
     if isinstance(node, ast.JoinedStr):
         # An f-string with no placeholders is just a literal.
         if any(isinstance(v, ast.FormattedValue) for v in node.values):
@@ -259,7 +250,10 @@ def _is_interpolated(
                 # `str.encode(s)` and `builtins.str.encode(s)` alike: the receiver
                 # names the type, so the source is the first argument.
                 if _constructor_name(function.value, shadowed) is not None:
-                    return _is_interpolated(node.args[0], resolve, shadowed) if node.args else None
+                    return (
+                        _is_interpolated(node.args[0], resolve, shadowed)
+                        if node.args else None
+                    )
                 # Unwrap the receiver: the conversion changes the type, not the syntax.
                 return _is_interpolated(function.value, resolve, shadowed)
         constructor = _constructor_name(function, shadowed)
@@ -332,8 +326,11 @@ def _pattern_bindings(pattern: ast.AST, captures_subject: bool = True):
                 yield child.name, False
             elif isinstance(child, ast.MatchStar) and child.name is not None:
                 yield child.name, False
-        if isinstance(pattern, ast.MatchMapping) and pattern.rest is not None:
-            yield pattern.rest, False
+            elif isinstance(child, ast.MatchMapping) and child.rest is not None:
+                # `rest` is a plain string field rather than a child node, so
+                # `ast.walk` never reaches it. Checking only the top-level pattern
+                # missed `case C({**payload})`, where `payload` really is rebound.
+                yield child.rest, False
 
 
 def _sink_name(function: ast.AST, aliases = None) -> str | None:
@@ -373,7 +370,17 @@ def _source_argument(node: ast.Call, sink: str) -> ast.AST | None:
     sink arguments this way.
     """
     if node.args:
-        return node.args[0]
+        # `exec(*[], *[f"..."])` is valid, and the first AST argument contributes no
+        # values. Statically visible empty expansions are stepped over so the real
+        # first positional value is found; anything opaque stops the search, since
+        # nothing here knows how many values it contributes.
+        for argument in node.args:
+            if isinstance(argument, ast.Starred):
+                inner = argument.value
+                if isinstance(inner, (ast.Tuple, ast.List, ast.Set)) and not inner.elts:
+                    continue
+            return argument
+        return None
     if sink.rpartition(".")[2] == "compile":
         for keyword in node.keywords:
             if keyword.arg == "source":
@@ -414,6 +421,9 @@ class _Visitor(ast.NodeVisitor):
         # Names this scope declared `global`, so a rebinding of one updates the module
         # rather than a fresh function-level entry that the outer state then outvotes.
         self.global_names: list[set[str]] = [set()]
+        # Names declared `nonlocal`, which rebind in the nearest enclosing FUNCTION
+        # scope rather than at module level.
+        self.nonlocal_names: list[set[str]] = [set()]
 
     def _visible_scopes(self):
         """Scope indices a name lookup here may consult, innermost first.
@@ -507,7 +517,9 @@ class _Visitor(ast.NodeVisitor):
             self.visit(part)
 
         self.scope.append(node.name)
-        self.scope_kinds.append("class" if isinstance(node, ast.ClassDef) else "function")
+        self.scope_kinds.append(
+            "class" if isinstance(node, ast.ClassDef) else "function"
+        )
         # A fresh scope: a name built in one function says nothing about the same name
         # in another.
         self.tainted.append({})
@@ -518,14 +530,13 @@ class _Visitor(ast.NodeVisitor):
         self.sink_aliases.append({})
         self.shadowed_sinks.append(set())
         self.global_names.append(set())
+        self.nonlocal_names.append(set())
         if not isinstance(node, ast.ClassDef):
             arguments = node.args
+            defaults = self._sink_defaults(arguments)
             for argument in (
-                *arguments.posonlyargs,
-                *arguments.args,
-                *arguments.kwonlyargs,
-                arguments.vararg,
-                arguments.kwarg,
+                *arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs,
+                arguments.vararg, arguments.kwarg,
             ):
                 if argument is None:
                     continue
@@ -533,6 +544,10 @@ class _Visitor(ast.NodeVisitor):
                 # cover an alias as well as the literal spelling: with
                 # `from builtins import exec as run` at module level, `def f(run, x)`
                 # supplies its own `run`.
+                if defaults.get(argument.arg):
+                    # `def f(name, exec = exec)` supplies the builtin itself unless the
+                    # caller overrides it, so the body really can reach the sink.
+                    continue
                 if self._binds_over_sink(argument.arg):
                     self.shadowed_sinks[-1].add(argument.arg)
                     self.sink_aliases[-1].pop(argument.arg, None)
@@ -544,6 +559,7 @@ class _Visitor(ast.NodeVisitor):
         self.sink_aliases.pop()
         self.shadowed_sinks.pop()
         self.global_names.pop()
+        self.nonlocal_names.pop()
         self.tainted.pop()
         self.scope.pop()
         self.scope_kinds.pop()
@@ -673,8 +689,10 @@ class _Visitor(ast.NodeVisitor):
             self.tainted[-1].update(aggregated)
         self.visit(node.target)
         # `for exec in callbacks:` calls the callback in the body, not the builtin.
-        names = {child.id for child in ast.walk(node.target) if isinstance(child, ast.Name)}
-        saved_scope = self._shadow_locals(names)
+        names = {
+            child.id for child in ast.walk(node.target) if isinstance(child, ast.Name)
+        }
+        saved_scope = self._shadow_locals(self._sink_valued(names, node.target, node.iter))
         for statement in node.body:
             self.visit(statement)
         # The `else` suite also runs when the iterable was empty, in which case the
@@ -738,6 +756,16 @@ class _Visitor(ast.NodeVisitor):
         self.global_names[-1].update(node.names)
         self.generic_visit(node)
 
+    def visit_Nonlocal(self, node: ast.Nonlocal):
+        """`nonlocal exec` sends later rebindings to the nearest enclosing function.
+
+        Same problem `global` had: the update went into this scope's fresh bookkeeping
+        while the enclosing entry, which is the one that actually applies, stayed
+        stale and outvoted it.
+        """
+        self.nonlocal_names[-1].update(node.names)
+        self.generic_visit(node)
+
     def visit_ExceptHandler(self, node: ast.ExceptHandler):
         """`except Exception as payload:` rebinds, and then deletes, the name.
 
@@ -756,7 +784,14 @@ class _Visitor(ast.NodeVisitor):
             self.visit(statement)
         if node.name is not None:
             self.tainted[-1].pop(node.name, None)
-            self.shadowed_sinks[-1].discard(node.name)
+            # Python unbinds the name when the handler exits, so at module or class
+            # scope the bare spelling resolves through builtins again. Inside a
+            # function it does not: the compiler still treats it as a local, and a
+            # later reference raises UnboundLocalError rather than calling the
+            # builtin, so the shadow has to stay - same distinction `visit_Delete`
+            # already draws.
+            if self.scope_kinds[-1] != "function":
+                self.shadowed_sinks[-1].discard(node.name)
 
     def visit_With(self, node: ast.With):
         """`with ... as payload:` rebinds unconditionally before the body runs.
@@ -832,11 +867,15 @@ class _Visitor(ast.NodeVisitor):
             self.tainted[-1][target.id] = f"{reason} via `{target.id}`"
 
     @staticmethod
-    def _declared_global(body) -> set:
-        """Names this statement list declares `global`, for the pre-pass."""
+    def _declared_outer(body) -> set:
+        """Names this statement list declares `global` or `nonlocal`, for the pre-pass.
+
+        Neither is a local binding, so an assignment to one must not be recorded as a
+        shadow of this scope; it is handled where the name actually lives.
+        """
         names = set()
         for statement in body:
-            if isinstance(statement, ast.Global):
+            if isinstance(statement, (ast.Global, ast.Nonlocal)):
                 names.update(statement.names)
         return names
 
@@ -851,7 +890,12 @@ class _Visitor(ast.NodeVisitor):
         """
         for statement in body:
             if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                # A nested definition is its own scope and collects for itself.
+                # Its body is its own scope and collects for itself, but the statement
+                # still BINDS its name here, so a sibling defined above it closes over
+                # this function rather than an outer alias of the same name.
+                if statement.name not in self._declared_outer(body):
+                    if self._alias(statement.name) or self._alias(f"module:{statement.name}"):
+                        self.shadowed_sinks[-1].add(statement.name)
                 continue
             if isinstance(statement, ast.ImportFrom):
                 if statement.module == "builtins" and not statement.level:
@@ -872,7 +916,8 @@ class _Visitor(ast.NodeVisitor):
                 # `run` print inside `inner`. Recorded as a shadow rather than a value,
                 # since what it becomes is not this checker's business.
                 targets = (
-                    statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+                    statement.targets if isinstance(statement, ast.Assign)
+                    else [statement.target]
                 )
                 for target in targets:
                     for child in ast.walk(target):
@@ -880,7 +925,7 @@ class _Visitor(ast.NodeVisitor):
                             # A `global` name is not a local binding at all, so it must
                             # not be recorded as shadowing this scope - the assignment
                             # updates the module and is handled there.
-                            if child.id in self._declared_global(body):
+                            if child.id in self._declared_outer(body):
                                 continue
                             if self._alias(child.id) or self._alias(f"module:{child.id}"):
                                 self.shadowed_sinks[-1].add(child.id)
@@ -956,8 +1001,44 @@ class _Visitor(ast.NodeVisitor):
             or self._is_shadowed(name)
         )
 
+    def _sink_defaults(self, arguments) -> dict:
+        """`{parameter: whether its default is visibly a sink}`.
+
+        Defaults line up with the TAIL of the positional parameters, and keyword-only
+        defaults are positional against `kwonlyargs` with `None` for "no default".
+        """
+        answer: dict = {}
+        positional = [*arguments.posonlyargs, *arguments.args]
+        for argument, default in zip(positional[len(positional) - len(arguments.defaults):],
+                                     arguments.defaults):
+            answer[argument.arg] = _sink_name(default, self._alias) is not None
+        for argument, default in zip(arguments.kwonlyargs, arguments.kw_defaults):
+            if default is not None:
+                answer[argument.arg] = _sink_name(default, self._alias) is not None
+        return answer
+
+    def _sink_valued(self, names, target, iterable) -> dict:
+        """`{name: whether the literal iterable visibly binds it to a sink}`.
+
+        Only a plain name target over a literal container, and only when EVERY element
+        resolves to a sink - one element that does not means the body may see something
+        else, and suppressing resolution is the safe answer there.
+        """
+        answer = {name: False for name in names}
+        if not isinstance(target, ast.Name) or target.id not in names:
+            return answer
+        if not isinstance(iterable, (ast.Tuple, ast.List, ast.Set)) or not iterable.elts:
+            return answer
+        if all(_sink_name(element, self._alias) is not None for element in iterable.elts):
+            answer[target.id] = True
+        return answer
+
     def _shadow_locals(self, names):
         """Make `names` stop resolving to a sink for a nested binding construct.
+
+        `names` may be a mapping from name to "this binding is visibly a sink", which
+        a loop or comprehension over a literal can answer: `for exec in [builtins.exec]`
+        binds the builtin back to its own spelling and must keep resolving.
 
         Returns what to hand back to `_restore_locals`. Both the shadow set and the
         alias table are snapshotted: adding to `shadowed_sinks` alone was not enough
@@ -967,6 +1048,10 @@ class _Visitor(ast.NodeVisitor):
         saved_shadow = set(self.shadowed_sinks[-1])
         saved_alias = dict(self.sink_aliases[-1])
         for name in names:
+            if names.get(name) if isinstance(names, dict) else False:
+                # The binding is visibly the builtin itself, so it is not shadowed:
+                # `for exec in [builtins.exec]` really does call `exec` in the body.
+                continue
             if self._binds_over_sink(name):
                 self.shadowed_sinks[-1].add(name)
                 self.sink_aliases[-1].pop(name, None)
@@ -977,6 +1062,22 @@ class _Visitor(ast.NodeVisitor):
         saved_shadow, saved_alias = saved
         self.shadowed_sinks[-1] = saved_shadow
         self.sink_aliases[-1] = saved_alias
+
+    def _binding_level(self, name: str) -> int:
+        """Which scope a rebinding of `name` here updates.
+
+        `global` goes to module scope; `nonlocal` to the nearest enclosing function,
+        skipping class bodies, which a `nonlocal` cannot name; everything else stays
+        local.
+        """
+        if name in self.global_names[-1]:
+            return 0
+        if name in self.nonlocal_names[-1]:
+            for index in range(len(self.scope_kinds) - 2, 0, -1):
+                if self.scope_kinds[index] == "function":
+                    return index
+            return 0
+        return len(self.scope_kinds) - 1
 
     def _shadow_assignment(self, target: ast.AST, value: ast.AST) -> None:
         """Record `compile = re.compile`, which makes the bare name not the builtin.
@@ -1001,7 +1102,7 @@ class _Visitor(ast.NodeVisitor):
         if resolved is not None:
             # `exec = builtins.exec` under `global exec` puts the builtin back at
             # module level, where the earlier `exec = print` shadow lives.
-            level = 0 if target.id in self.global_names[-1] else -1
+            level = self._binding_level(target.id)
             self.shadowed_sinks[level].discard(target.id)
             if target.id not in SINKS:
                 # `run = print` then `run = builtins.exec` has to make `run` an alias
@@ -1011,7 +1112,7 @@ class _Visitor(ast.NodeVisitor):
                 self.sink_aliases[level][target.id] = sink
                 self.collected_aliases[level][target.id] = sink
             return
-        level = 0 if target.id in self.global_names[-1] else -1
+        level = self._binding_level(target.id)
         self.shadowed_sinks[level].add(target.id)
         self.sink_aliases[level].pop(target.id, None)
         self.collected_aliases[level].pop(target.id, None)
@@ -1059,10 +1160,12 @@ class _Visitor(ast.NodeVisitor):
         args = node.args
         for default in (*args.defaults, *(d for d in args.kw_defaults if d is not None)):
             self.visit(default)
+        defaults = self._sink_defaults(args)
         shadowed = {
             arg.arg
-            for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs, args.vararg, args.kwarg)
-            if arg is not None
+            for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs,
+                        args.vararg, args.kwarg)
+            if arg is not None and not defaults.get(arg.arg)
         }
         saved = dict(self.tainted[-1])
         for name in shadowed:
@@ -1120,7 +1223,18 @@ class _Visitor(ast.NodeVisitor):
             if isinstance(child, ast.Name)
         }
         saved = dict(self.tainted[-1])
-        saved_scope = self._shadow_locals(targets)
+        sink_valued: dict = {}
+        for generator in generators:
+            sink_valued.update(self._sink_valued(
+                {
+                    child.id
+                    for child in ast.walk(generator.target)
+                    if isinstance(child, ast.Name)
+                },
+                generator.target,
+                generator.iter,
+            ))
+        saved_scope = self._shadow_locals({**{n: False for n in targets}, **sink_valued})
         if self.scope_kinds[-1] == "class":
             # Same as the lambda: a comprehension in a class body cannot see class
             # locals either.
@@ -1132,15 +1246,23 @@ class _Visitor(ast.NodeVisitor):
         self.sink_aliases.append({})
         self.shadowed_sinks.append(set())
         self.global_names.append(set())
+        self.nonlocal_names.append(set())
 
         for index, generator in enumerate(generators):
-            if index:
-                # The outermost iterable was visited by the caller, in the enclosing
-                # state; every later one is evaluated here, before its own target is
-                # bound but after the earlier targets are.
+            if not index:
+                # The outermost iterable is evaluated in the ENCLOSING state, before
+                # any target is bound. It used to be visited by `generic_visit`; giving
+                # comprehensions their own handler and only visiting the later ones
+                # meant a sink inside it was never seen at all.
+                self.visit(generator.iter)
+            else:
+                # Every later one is evaluated here, before its own target is bound but
+                # after the earlier targets are.
                 self.visit(generator.iter)
             names = {
-                child.id for child in ast.walk(generator.target) if isinstance(child, ast.Name)
+                child.id
+                for child in ast.walk(generator.target)
+                if isinstance(child, ast.Name)
             }
             for name in names:
                 self.tainted[-1].pop(name, None)
@@ -1173,6 +1295,7 @@ class _Visitor(ast.NodeVisitor):
         self.sink_aliases.pop()
         self.shadowed_sinks.pop()
         self.global_names.pop()
+        self.nonlocal_names.pop()
         for name in targets:
             self.tainted[-1].pop(name, None)
         self.tainted[-1] = saved
