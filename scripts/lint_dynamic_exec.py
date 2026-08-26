@@ -379,9 +379,7 @@ class _Visitor(ast.NodeVisitor):
             self.visit(part)
 
         self.scope.append(node.name)
-        self.scope_kinds.append(
-            "class" if isinstance(node, ast.ClassDef) else "function"
-        )
+        self.scope_kinds.append("class" if isinstance(node, ast.ClassDef) else "function")
         # A fresh scope: a name built in one function says nothing about the same name
         # in another.
         self.tainted.append({})
@@ -393,8 +391,11 @@ class _Visitor(ast.NodeVisitor):
         if not isinstance(node, ast.ClassDef):
             arguments = node.args
             for argument in (
-                *arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs,
-                arguments.vararg, arguments.kwarg,
+                *arguments.posonlyargs,
+                *arguments.args,
+                *arguments.kwonlyargs,
+                arguments.vararg,
+                arguments.kwarg,
             ):
                 if argument is None:
                     continue
@@ -1096,7 +1097,7 @@ def _neutralised(source: str) -> str:
                         consumed += 1
                         if not piece.endswith("\\"):
                             break
-                    argument = _magic_argument(" ".join(joined).lstrip()[len(magic) + 1:])
+                    argument = _magic_argument(" ".join(joined).lstrip()[len(magic) + 1 :])
                     out.append(indent + argument)
                     out.extend([""] * (consumed - 1))
                     skip = consumed - 1
