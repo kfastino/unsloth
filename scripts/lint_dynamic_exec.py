@@ -227,6 +227,38 @@ def _is_interpolated(node: ast.AST, resolve = None) -> str | None:
     return None
 
 
+def _pattern_bindings(pattern: ast.AST, captures_subject: bool = True):
+    """`(name, captures_subject)` for each name a match pattern binds.
+
+    `captures_subject` says whether the name receives the subject itself, which is the
+    only case where the subject's reason carries over. A sequence element binds a PART
+    of the subject, so it is reported as a binding that does not carry the reason,
+    which clears any stale value instead of inventing one.
+    """
+    if isinstance(pattern, ast.MatchAs):
+        if pattern.name is not None:
+            yield pattern.name, captures_subject and pattern.pattern is None
+        if pattern.pattern is not None:
+            yield from _pattern_bindings(pattern.pattern, captures_subject)
+    elif isinstance(pattern, ast.MatchStar):
+        if pattern.name is not None:
+            yield pattern.name, False
+    elif isinstance(pattern, ast.MatchOr):
+        for alternative in pattern.patterns:
+            yield from _pattern_bindings(alternative, captures_subject)
+    elif isinstance(pattern, ast.MatchSequence):
+        for element in pattern.patterns:
+            yield from _pattern_bindings(element, False)
+    elif isinstance(pattern, (ast.MatchClass, ast.MatchMapping)):
+        for child in ast.walk(pattern):
+            if isinstance(child, ast.MatchAs) and child.name is not None:
+                yield child.name, False
+            elif isinstance(child, ast.MatchStar) and child.name is not None:
+                yield child.name, False
+        if isinstance(pattern, ast.MatchMapping) and pattern.rest is not None:
+            yield pattern.rest, False
+
+
 def _sink_name(function: ast.AST, aliases = None) -> str | None:
     """The sink this call target names, if any.
 
@@ -435,8 +467,6 @@ class _Visitor(ast.NodeVisitor):
         to something that is not a built string clears it, so this does not accumulate
         false positives.
         """
-        for target in node.targets:
-            self._shadow_assignment(target, node.value)
         reason = _is_interpolated(node.value)
         # Runtime order, not source order. The right hand side is evaluated first,
         # then the targets are assigned left to right, and a target that is not a
@@ -449,6 +479,7 @@ class _Visitor(ast.NodeVisitor):
             self.visit(target)
             self._bind(target, reason)
             self._bind_unpacked(target, node.value)
+            self._shadow_assignment(target, node.value)
 
     def visit_AnnAssign(self, node: ast.AnnAssign):
         """Same tracking for `payload: str = f"...{x}..."`.
@@ -524,6 +555,30 @@ class _Visitor(ast.NodeVisitor):
             self.visit(statement)
 
     visit_AsyncFor = visit_For
+
+    def visit_Match(self, node: ast.Match):
+        """`match f"import {name}": case payload: exec(payload)` binds the subject.
+
+        An irrefutable capture pattern is a binding form like the assignments and loop
+        targets already tracked, and it sits at the same one level of indirection: the
+        subject is visible right there. Only capture patterns and the elements of a
+        sequence pattern are read, both of which name what they bind outright. A class
+        or mapping pattern binds from somewhere this does not model, so its names are
+        cleared rather than guessed at.
+        """
+        self.visit(node.subject)
+        reason = _is_interpolated(node.subject, self.tainted[-1].get)
+        for case in node.cases:
+            for name, captures_subject in _pattern_bindings(case.pattern):
+                self.tainted[-1][name] = f"{reason} via `{name}`" if (
+                    reason is not None and captures_subject
+                ) else None
+                if self.tainted[-1][name] is None:
+                    self.tainted[-1].pop(name, None)
+            if case.guard is not None:
+                self.visit(case.guard)
+            for statement in case.body:
+                self.visit(statement)
 
     def visit_ExceptHandler(self, node: ast.ExceptHandler):
         """`except Exception as payload:` rebinds, and then deletes, the name.
@@ -668,32 +723,25 @@ class _Visitor(ast.NodeVisitor):
 
         Only a plain name target, and only when the value is not itself a reference to
         the same builtin, so `exec = exec` and `exec = builtins.exec` keep resolving to
-        the sink. Deliberately not chased any further than that: this checker does not
+        the sink. An imported alias counts as well: `from builtins import exec as run`
+        followed by `run = print` makes `run` print, so the spelling alone is not the
+        test.
+
+        Applied AFTER the right hand side has been visited, because that is when Python
+        binds it. Doing it first meant `exec = exec(f"import {name}")` suppressed the
+        very call it was assigning from. Deliberately not chased any further than that: this checker does not
         follow value flow, and something like `exec = getattr(builtins, "exec")` is
         obfuscation rather than the good-faith code this gate exists to protect.
         """
-        if not isinstance(target, ast.Name) or target.id not in SINKS:
+        if not isinstance(target, ast.Name):
+            return
+        if target.id not in SINKS and not self._alias(target.id):
             return
         if _sink_name(value, self._alias) is not None:
             self.shadowed_sinks[-1].discard(target.id)
             return
         self.shadowed_sinks[-1].add(target.id)
-
-    def _shadow_assignment(self, target: ast.AST, value: ast.AST) -> None:
-        """Record `compile = re.compile`, which makes the bare name not the builtin.
-
-        Only a plain name target, and only when the value is not itself a reference to
-        the same builtin, so `exec = exec` and `exec = builtins.exec` keep resolving to
-        the sink. Deliberately not chased any further than that: this checker does not
-        follow value flow, and something like `exec = getattr(builtins, "exec")` is
-        obfuscation rather than the good-faith code this gate exists to protect.
-        """
-        if not isinstance(target, ast.Name) or target.id not in SINKS:
-            return
-        if _sink_name(value, self._alias) is not None:
-            self.shadowed_sinks[-1].discard(target.id)
-            return
-        self.shadowed_sinks[-1].add(target.id)
+        self.sink_aliases[-1].pop(target.id, None)
 
     def _shadow_sink(self, name: str) -> None:
         """Record that `name` was bound to something that is not the builtin.
@@ -1045,15 +1093,23 @@ def _neutralised(source: str) -> str:
                 # Store context only. `outputs[payload] = !cmd` READS `payload` to
                 # index with; it does not rebind it, and clearing it there turned this
                 # cleanup into a bypass.
-                names = sorted(
-                    {
-                        child.id
-                        for node in _targets
-                        for child in ast.walk(node)
-                        if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store)
-                    }
-                )
-                left = " = ".join(names) if names else target
+                names = sorted({
+                    child.id
+                    for node in _targets
+                    for child in ast.walk(node)
+                    if isinstance(child, ast.Name)
+                    and isinstance(child.ctx, ast.Store)
+                })
+                # A target that is not a plain name is KEPT rather than dropped:
+                # `result = outputs[exec(payload)] = !cmd` still evaluates the
+                # subscript, so replacing the whole chain with `result = None` threw
+                # the sink away. Each such target is spliced back into the chain.
+                kept = [
+                    ast.unparse(node)
+                    for node in _targets
+                    if not isinstance(node, ast.Name)
+                ]
+                left = " = ".join([*kept, *names]) if (kept or names) else target
                 out.append(f"{indent}{left} = None")
             continuing = line.rstrip().endswith("\\")
             continue
@@ -1063,13 +1119,22 @@ def _neutralised(source: str) -> str:
             continue
         stripped = line.lstrip()
         automagic = stripped.split(maxsplit = 1)[0] if stripped else ""
-        if automagic in _CODE_MAGICS and not stripped.startswith(("%", "!")):
+        remainder = stripped.split(maxsplit = 1)
+        if (
+            automagic in _CODE_MAGICS
+            and len(remainder) > 1
+            and not stripped.startswith(("%", "!"))
+        ):
             # IPython's automagic lets `timeit exec(payload)` run the sink without a
             # leading `%`. The raw cell does not parse and nothing here rewrote the
             # line, so the cell was skipped along with the sink. Only rewritten when
-            # the remainder is Python, so an ordinary `capture = 1` is untouched.
+            # the remainder is Python, so an ordinary `capture = 1` is untouched, and
+            # only when there IS a remainder: a line holding nothing but `timeit` is a
+            # bare name expression, and reaching for a second token raised IndexError
+            # out of `_neutralised`, which aborted the whole run rather than skipping
+            # one cell.
             indent = line[: len(line) - len(stripped)]
-            argument = _magic_argument(stripped.split(maxsplit = 1)[1])
+            argument = _magic_argument(remainder[1])
             try:
                 ast.parse(argument)
             except (SyntaxError, ValueError):
@@ -1114,6 +1179,13 @@ def _neutralised(source: str) -> str:
     return "\n".join(out)
 
 
+# `%%script` options that take their value in the following token.
+_SCRIPT_VALUE_OPTIONS = ("--out", "--err", "--proc")
+
+# `env` options that take their value in the following token.
+_ENV_VALUE_OPTIONS = ("-u", "--unset", "-C", "--chdir", "-S", "--split-string")
+
+
 def _runs_python(argument: str) -> bool:
     """Whether a `%%script` argument names a Python interpreter.
 
@@ -1142,8 +1214,20 @@ def _runs_python(argument: str) -> bool:
             # options and any `NAME=value` assignments come first, so they are stepped
             # over before the real command is read.
             index += 1
-            while index < len(tokens) and (tokens[index].startswith("-") or "=" in tokens[index]):
-                index += 1
+            while index < len(tokens):
+                token = tokens[index]
+                if "=" in token and not token.startswith("-"):
+                    index += 1
+                    continue
+                if not token.startswith("-"):
+                    break
+                # `env -u FOO python`: `-u/--unset` and `-C/--chdir` take a mandatory
+                # argument, so skipping only the option left `FOO` looking like the
+                # command and the Python cell was classified as foreign.
+                if token.split("=", 1)[0] in _ENV_VALUE_OPTIONS and "=" not in token:
+                    index += 2
+                else:
+                    index += 1
             continue
         return command.startswith("python")
     return False
