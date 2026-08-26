@@ -158,7 +158,11 @@ def _constructor_source(node: ast.Call, name: str) -> ast.AST | None:
     return None
 
 
-def _literal_element(node: ast.Subscript, resolve = None, shadowed = None) -> str | None:
+def _literal_element(
+    node: ast.Subscript,
+    resolve = None,
+    shadowed = None,
+) -> str | None:
     """The reason for `<literal>[<constant>]`, or None when it is not that shape."""
     container, index = node.value, node.slice
     if not isinstance(index, ast.Constant):
@@ -178,7 +182,11 @@ def _literal_element(node: ast.Subscript, resolve = None, shadowed = None) -> st
     return None
 
 
-def _is_interpolated(node: ast.AST, resolve = None, shadowed = None) -> str | None:
+def _is_interpolated(
+    node: ast.AST,
+    resolve = None,
+    shadowed = None,
+) -> str | None:
     """Returns why `node` is a built string, or None if it is not one.
 
     `resolve` maps a bare name to the reason it is tainted, or None. It is passed
@@ -225,7 +233,9 @@ def _is_interpolated(node: ast.AST, resolve = None, shadowed = None) -> str | No
     if isinstance(node, ast.IfExp):
         # `exec(f"import {name}" if flag else "import os")` executes whichever branch
         # is taken, so either one being built is enough.
-        return _is_interpolated(node.body, resolve, shadowed) or _is_interpolated(node.orelse, resolve, shadowed)
+        return _is_interpolated(node.body, resolve, shadowed) or _is_interpolated(
+            node.orelse, resolve, shadowed
+        )
     if isinstance(node, ast.JoinedStr):
         # An f-string with no placeholders is just a literal.
         if any(isinstance(v, ast.FormattedValue) for v in node.values):
@@ -250,10 +260,7 @@ def _is_interpolated(node: ast.AST, resolve = None, shadowed = None) -> str | No
                 # `str.encode(s)` and `builtins.str.encode(s)` alike: the receiver
                 # names the type, so the source is the first argument.
                 if _constructor_name(function.value, shadowed) is not None:
-                    return (
-                        _is_interpolated(node.args[0], resolve, shadowed)
-                        if node.args else None
-                    )
+                    return _is_interpolated(node.args[0], resolve, shadowed) if node.args else None
                 # Unwrap the receiver: the conversion changes the type, not the syntax.
                 return _is_interpolated(function.value, resolve, shadowed)
         constructor = _constructor_name(function, shadowed)
@@ -517,9 +524,7 @@ class _Visitor(ast.NodeVisitor):
             self.visit(part)
 
         self.scope.append(node.name)
-        self.scope_kinds.append(
-            "class" if isinstance(node, ast.ClassDef) else "function"
-        )
+        self.scope_kinds.append("class" if isinstance(node, ast.ClassDef) else "function")
         # A fresh scope: a name built in one function says nothing about the same name
         # in another.
         self.tainted.append({})
@@ -535,8 +540,11 @@ class _Visitor(ast.NodeVisitor):
             arguments = node.args
             defaults = self._sink_defaults(arguments)
             for argument in (
-                *arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs,
-                arguments.vararg, arguments.kwarg,
+                *arguments.posonlyargs,
+                *arguments.args,
+                *arguments.kwonlyargs,
+                arguments.vararg,
+                arguments.kwarg,
             ):
                 if argument is None:
                     continue
@@ -689,9 +697,7 @@ class _Visitor(ast.NodeVisitor):
             self.tainted[-1].update(aggregated)
         self.visit(node.target)
         # `for exec in callbacks:` calls the callback in the body, not the builtin.
-        names = {
-            child.id for child in ast.walk(node.target) if isinstance(child, ast.Name)
-        }
+        names = {child.id for child in ast.walk(node.target) if isinstance(child, ast.Name)}
         saved_scope = self._shadow_locals(self._sink_valued(names, node.target, node.iter))
         for statement in node.body:
             self.visit(statement)
@@ -916,8 +922,7 @@ class _Visitor(ast.NodeVisitor):
                 # `run` print inside `inner`. Recorded as a shadow rather than a value,
                 # since what it becomes is not this checker's business.
                 targets = (
-                    statement.targets if isinstance(statement, ast.Assign)
-                    else [statement.target]
+                    statement.targets if isinstance(statement, ast.Assign) else [statement.target]
                 )
                 for target in targets:
                     for child in ast.walk(target):
@@ -1009,8 +1014,9 @@ class _Visitor(ast.NodeVisitor):
         """
         answer: dict = {}
         positional = [*arguments.posonlyargs, *arguments.args]
-        for argument, default in zip(positional[len(positional) - len(arguments.defaults):],
-                                     arguments.defaults):
+        for argument, default in zip(
+            positional[len(positional) - len(arguments.defaults) :], arguments.defaults
+        ):
             answer[argument.arg] = _sink_name(default, self._alias) is not None
         for argument, default in zip(arguments.kwonlyargs, arguments.kw_defaults):
             if default is not None:
@@ -1163,8 +1169,7 @@ class _Visitor(ast.NodeVisitor):
         defaults = self._sink_defaults(args)
         shadowed = {
             arg.arg
-            for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs,
-                        args.vararg, args.kwarg)
+            for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs, args.vararg, args.kwarg)
             if arg is not None and not defaults.get(arg.arg)
         }
         saved = dict(self.tainted[-1])
@@ -1225,15 +1230,17 @@ class _Visitor(ast.NodeVisitor):
         saved = dict(self.tainted[-1])
         sink_valued: dict = {}
         for generator in generators:
-            sink_valued.update(self._sink_valued(
-                {
-                    child.id
-                    for child in ast.walk(generator.target)
-                    if isinstance(child, ast.Name)
-                },
-                generator.target,
-                generator.iter,
-            ))
+            sink_valued.update(
+                self._sink_valued(
+                    {
+                        child.id
+                        for child in ast.walk(generator.target)
+                        if isinstance(child, ast.Name)
+                    },
+                    generator.target,
+                    generator.iter,
+                )
+            )
         saved_scope = self._shadow_locals({**{n: False for n in targets}, **sink_valued})
         if self.scope_kinds[-1] == "class":
             # Same as the lambda: a comprehension in a class body cannot see class
@@ -1260,9 +1267,7 @@ class _Visitor(ast.NodeVisitor):
                 # after the earlier targets are.
                 self.visit(generator.iter)
             names = {
-                child.id
-                for child in ast.walk(generator.target)
-                if isinstance(child, ast.Name)
+                child.id for child in ast.walk(generator.target) if isinstance(child, ast.Name)
             }
             for name in names:
                 self.tainted[-1].pop(name, None)
