@@ -513,12 +513,33 @@ def __get_model_name(
 def _get_new_mapper():
     try:
         import requests
+        import time
 
         new_mapper = (
             "https://raw.githubusercontent.com/unslothai/unsloth/main/unsloth/models/mapper.py"
         )
-        with requests.get(new_mapper, timeout = 3) as new_mapper:
-            new_mapper = new_mapper.text
+        # Streamed, and stopped at the cap while reading. `requests.get` buffers and
+        # decodes the whole body before returning, so checking `len()` afterwards
+        # cannot prevent the exhaustion it is there to prevent: an endpoint - or
+        # anything that can answer for it - serving an endless body would be read to
+        # the end first. The read also has a total deadline, because `timeout` is
+        # per-read: a peer trickling bytes forever resets it on every chunk.
+        # The cap is a literal rather than a module constant on purpose: the probe is
+        # lifted out and run in an isolated namespace by its own tests, so a name
+        # resolved from module globals would raise inside the bare except and turn
+        # every one of those tests into a silent "the probe found nothing". The real
+        # mapper.py is around 50KB, so 10MB leaves a lot of room to grow.
+        byte_cap = 10_000_000
+        deadline = time.monotonic() + 10
+        chunks, total = [], 0
+        with requests.get(new_mapper, timeout = 3, stream = True) as response:
+            for chunk in response.iter_content(chunk_size = 65_536):
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > byte_cap or time.monotonic() > deadline:
+                    return {}, {}, {}, {}, {}
+            encoding = response.encoding or "utf-8"
+        new_mapper = b"".join(chunks).decode(encoding, errors = "replace")
         # Never exec the response. This is a plain HTTPS GET, so the body is whatever
         # the endpoint served, and exec'ing it would make any compromise of that path
         # - or of anything that can answer for it - arbitrary code execution inside
@@ -537,10 +558,9 @@ def _get_new_mapper():
         # whole tree before any literal-only check runs, and CPython dropped the safety
         # wording from the docs for that reason (python/cpython#95588). The bare except
         # below already turns the resulting RecursionError into "the probe found
-        # nothing", and `requests`' timeout is per-read rather than total, so cap the
-        # body as well. The real file is around 50KB.
-        if len(new_mapper) > 10_000_000:
-            return {}, {}, {}, {}, {}
+        # nothing". The byte cap is enforced above, while the body is being read,
+        # rather than here where the whole thing would already be in memory. The real
+        # file is around 50KB.
         tree = ast.parse(new_mapper)
         source_table = None
         for node in tree.body:

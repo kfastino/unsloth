@@ -77,8 +77,20 @@ def _without_fp8_tables(source):
 
 
 class _FakeResponse:
-    def __init__(self, text):
-        self.text = text
+    """The streaming half of `requests.Response`, which is all the probe uses.
+
+    `_get_new_mapper` reads the body in chunks and stops at its byte cap while
+    reading, because `requests.get` would otherwise buffer and decode the whole
+    response before any length check could run. A fake that only offers `.text`
+    would let that regress silently, so this models `iter_content` instead.
+    """
+
+    def __init__(self, text, chunks = None):
+        self.encoding = "utf-8"
+        self._chunks = chunks if chunks is not None else [text.encode("utf-8")]
+
+    def iter_content(self, chunk_size = 1):
+        yield from self._chunks
 
     def __enter__(self):
         return self
@@ -87,9 +99,9 @@ class _FakeResponse:
         return False
 
 
-def _install_fake_requests(monkeypatch, text):
+def _install_fake_requests(monkeypatch, text, chunks = None):
     module = types.ModuleType("requests")
-    module.get = lambda url, timeout = None: _FakeResponse(text)
+    module.get = lambda url, timeout = None, stream = False: _FakeResponse(text, chunks)
     monkeypatch.setitem(sys.modules, "requests", module)
 
 

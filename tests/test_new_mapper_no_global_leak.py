@@ -50,8 +50,20 @@ def _extract_get_new_mapper(namespace):
 
 
 class _FakeResponse:
-    def __init__(self, text):
-        self.text = text
+    """The streaming half of `requests.Response`, which is all the probe uses.
+
+    `_get_new_mapper` reads the body in chunks and stops at its byte cap while
+    reading, because `requests.get` would otherwise buffer and decode the whole
+    response before any length check could run. A fake that only offers `.text`
+    would let that regress silently, so this models `iter_content` instead.
+    """
+
+    def __init__(self, text, chunks = None):
+        self.encoding = "utf-8"
+        self._chunks = chunks if chunks is not None else [text.encode("utf-8")]
+
+    def iter_content(self, chunk_size = 1):
+        yield from self._chunks
 
     def __enter__(self):
         return self
@@ -60,9 +72,9 @@ class _FakeResponse:
         return False
 
 
-def _install_fake_requests(monkeypatch, text):
+def _install_fake_requests(monkeypatch, text, chunks = None):
     module = types.ModuleType("requests")
-    module.get = lambda url, timeout = None: _FakeResponse(text)
+    module.get = lambda url, timeout = None, stream = False: _FakeResponse(text, chunks)
     monkeypatch.setitem(sys.modules, "requests", module)
 
 
@@ -105,3 +117,30 @@ def test_get_new_mapper_leaves_no_helpers_behind(monkeypatch):
 
     leaked = set(namespace) - before
     assert not leaked, f"_get_new_mapper leaked {sorted(leaked)} into its module globals"
+
+
+def test_the_byte_cap_stops_the_read_instead_of_measuring_it_afterwards(monkeypatch):
+    """A cap applied after `requests.get` returns cannot prevent what it exists for.
+
+    `requests.get` buffers and decodes the whole body before handing it over, so
+    `len(text) > cap` only ever measures something already in memory. An endpoint - or
+    anything that can answer for it - serving an endless body would be read to the end
+    first. This pins the cap to the READ: the probe must stop pulling chunks, and must
+    return the empty tables it returns for every other failure.
+    """
+    served = []
+
+    def endless():
+        while True:
+            served.append(1)
+            if len(served) > 5_000:  # the probe should have stopped long before this
+                raise AssertionError("the probe kept reading past its cap")
+            yield b"x" * 65_536
+
+    _install_fake_requests(monkeypatch, "", chunks = endless())
+    get_new_mapper = _extract_get_new_mapper({})
+
+    assert get_new_mapper() == ({}, {}, {}, {}, {})
+    # 10MB at 64KB a chunk is about 160 chunks; anything near the guard above means the
+    # cap is not being enforced while reading.
+    assert len(served) < 200, len(served)

@@ -35,8 +35,19 @@ REAL_MAPPER = open(
 
 
 class _Response:
+    """The streaming half of `requests.Response`, which is all the probe uses.
+
+    The probe reads in chunks and stops at its byte cap while reading, because
+    `requests.get` would otherwise buffer and decode the whole body before any length
+    check could run. A fake offering only `.text` would let that regress silently.
+    """
+
     def __init__(self, text):
-        self.text = text
+        self.encoding = "utf-8"
+        self._body = text.encode("utf-8")
+
+    def iter_content(self, chunk_size = 1):
+        yield self._body
 
     def __enter__(self):
         return self
