@@ -624,9 +624,9 @@ class _Visitor(ast.NodeVisitor):
             bound = [name for name, _ in _pattern_bindings(case.pattern)]
             saved_scope = self._shadow_locals(bound)
             for name, captures_subject in _pattern_bindings(case.pattern):
-                self.tainted[-1][name] = f"{reason} via `{name}`" if (
-                    reason is not None and captures_subject
-                ) else None
+                self.tainted[-1][name] = (
+                    f"{reason} via `{name}`" if (reason is not None and captures_subject) else None
+                )
                 if self.tainted[-1][name] is None:
                     self.tainted[-1].pop(name, None)
             if case.guard is not None:
@@ -1054,8 +1054,7 @@ def _notebook_code_cells(path: Path) -> list[tuple[int, str]]:
         ) from None
     if not isinstance(document, dict) or not isinstance(document.get("cells", []), list):
         raise ScanError(
-            f"{_relative(path)}: is not a notebook document, so its code cells were "
-            f"not checked"
+            f"{_relative(path)}: is not a notebook document, so its code cells were " f"not checked"
         )
     cells = []
     for index, cell in enumerate(document.get("cells", [])):
@@ -1279,13 +1278,14 @@ def _neutralised(source: str) -> str:
                 # Store context only. `outputs[payload] = !cmd` READS `payload` to
                 # index with; it does not rebind it, and clearing it there turned this
                 # cleanup into a bypass.
-                names = sorted({
-                    child.id
-                    for node in _targets
-                    for child in ast.walk(node)
-                    if isinstance(child, ast.Name)
-                    and isinstance(child.ctx, ast.Store)
-                })
+                names = sorted(
+                    {
+                        child.id
+                        for node in _targets
+                        for child in ast.walk(node)
+                        if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store)
+                    }
+                )
                 # A target that is not a plain name is KEPT rather than dropped:
                 # `result = outputs[exec(payload)] = !cmd` still evaluates the
                 # subscript, so replacing the whole chain with `result = None` threw
@@ -1315,11 +1315,7 @@ def _neutralised(source: str) -> str:
         stripped = line.lstrip()
         automagic = stripped.split(maxsplit = 1)[0] if stripped else ""
         remainder = stripped.split(maxsplit = 1)
-        if (
-            automagic in _CODE_MAGICS
-            and len(remainder) > 1
-            and not stripped.startswith(("%", "!"))
-        ):
+        if automagic in _CODE_MAGICS and len(remainder) > 1 and not stripped.startswith(("%", "!")):
             # IPython's automagic lets `timeit exec(payload)` run the sink without a
             # leading `%`. The raw cell does not parse and nothing here rewrote the
             # line, so the cell was skipped along with the sink. Only rewritten when
@@ -1441,8 +1437,10 @@ def _runs_python(argument: str) -> bool:
                 if name in ("-S", "--split-string"):
                     # `env -S "python -u"` puts the whole command in one argument, so
                     # the wrapped command is inside that value rather than after it.
-                    value = token.split("=", 1)[1] if "=" in token else (
-                        tokens[index + 1] if index + 1 < len(tokens) else ""
+                    value = (
+                        token.split("=", 1)[1]
+                        if "=" in token
+                        else (tokens[index + 1] if index + 1 < len(tokens) else "")
                     )
                     return _runs_python(value)
                 if name in _ENV_VALUE_OPTIONS and "=" not in token:
@@ -1665,11 +1663,24 @@ def collect_paths(targets: list[str]) -> tuple[list[Path], list[str]]:
 # carries third-party and generated Python that this gate has no business failing on,
 # and `--update` would otherwise write allowlist entries for files a clean CI checkout
 # does not even have.
-_EXCLUDED_PARTS = frozenset({
-    "tests", "node_modules", "build", "dist", ".venv", "venv", "site-packages",
-    ".git", ".tox", ".mypy_cache", ".pytest_cache", "__pycache__", ".ipynb_checkpoints",
-    ".eggs",
-})
+_EXCLUDED_PARTS = frozenset(
+    {
+        "tests",
+        "node_modules",
+        "build",
+        "dist",
+        ".venv",
+        "venv",
+        "site-packages",
+        ".git",
+        ".tox",
+        ".mypy_cache",
+        ".pytest_cache",
+        "__pycache__",
+        ".ipynb_checkpoints",
+        ".eggs",
+    }
+)
 
 
 def _exclusion_parts(path: Path, root: Path) -> tuple[str, ...]:
