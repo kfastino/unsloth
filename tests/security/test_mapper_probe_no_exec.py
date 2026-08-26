@@ -20,6 +20,8 @@ blocks non-loopback sockets anyway.
 """
 
 import builtins
+import pathlib
+import re
 import types
 from contextlib import contextmanager
 
@@ -169,20 +171,43 @@ def test_a_deeply_nested_body_is_survivable(monkeypatch):
         assert loader_utils._get_new_mapper() == ({}, {}, {}, {}, {})
 
 
+def _byte_cap():
+    """The cap as the probe actually spells it, so lowering it cannot desync this."""
+    source = pathlib.Path(loader_utils.__file__).read_text(encoding = "utf-8")
+    match = re.search(r"^\s*byte_cap = ([0-9_]+)$", source, re.MULTILINE)
+    assert match is not None, "the mapper probe no longer has a byte cap"
+    return int(match.group(1).replace("_", ""))
+
+
 def test_an_oversized_body_is_not_parsed_at_all(monkeypatch):
     """The size cap, which bounds parse cost rather than correctness.
 
     `requests`' timeout is per-read, not total, so a body can be arbitrarily large. The
-    real mapper.py is around 50KB against a 10MB cap.
+    real mapper.py is around 50KB.
     """
-    body = "__INT_TO_FLOAT_MAPPER = {'a' : ('b',)}\n" + ("# padding\n" * 1_100_000)
-    assert len(body) > 10_000_000
+    cap = _byte_cap()
+    body = "__INT_TO_FLOAT_MAPPER = {'a' : ('b',)}\n" + ("# padding\n" * (cap // 10 + 1))
+    assert len(body) > cap
     with _serving(body, monkeypatch):
         assert loader_utils._get_new_mapper() == ({}, {}, {}, {}, {})
 
 
+def test_the_cap_bounds_parse_cost_not_just_download_size():
+    """Short statements are the dense case: each one is several AST nodes.
+
+    A body made of them stays well inside a generous cap while parsing to millions of
+    nodes, which is why the cap is set from what the parse can afford rather than from
+    what the network can afford.
+    """
+    cap = _byte_cap()
+    assert cap <= 2_000_000, (
+        f"a {cap} byte cap admits roughly {cap // 4} short statements, which is a "
+        f"memory blow-up in ast.parse rather than a bounded read"
+    )
+
+
 def test_the_real_mapper_is_far_below_the_cap():
-    assert len(REAL_MAPPER) < 10_000_000 / 10
+    assert len(REAL_MAPPER) < _byte_cap() / 2
 
 
 # --- the probe still works ---------------------------------------------------

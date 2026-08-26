@@ -157,7 +157,7 @@ def test_the_byte_cap_stops_the_read_instead_of_measuring_it_afterwards(monkeypa
     get_new_mapper = _extract_get_new_mapper({})
 
     assert get_new_mapper() == ({}, {}, {}, {}, {})
-    # 10MB at 64KB a chunk is about 160 chunks; anything near the guard above means the
+    # The cap at 64KB a chunk is a few dozen chunks; anything near the guard above means the
     # cap is not being enforced while reading.
     assert len(served) < 200, len(served)
 

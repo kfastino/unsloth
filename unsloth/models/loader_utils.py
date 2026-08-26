@@ -529,7 +529,10 @@ def _get_new_mapper():
         # resolved from module globals would raise inside the bare except and turn
         # every one of those tests into a silent "the probe found nothing". The real
         # mapper.py is around 50KB, so 10MB leaves a lot of room to grow.
-        byte_cap = 10_000_000
+        # The parse below allocates far more than the text it reads: ten megabytes of
+        # short statements is roughly two million AST nodes, which is a memory blow-up
+        # well inside the old cap. The real file is a few tens of kilobytes.
+        byte_cap = 1_000_000
         deadline = time.monotonic() + 10
         chunks, total = [], 0
         # Redirects are followed by hand. `requests` otherwise follows them inside

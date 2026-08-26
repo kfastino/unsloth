@@ -59,6 +59,10 @@ def _module_level_statements(body):
                     yield from _module_level_statements(child.body)
                 elif isinstance(child, ast.stmt):
                     yield from _module_level_statements([child])
+        # `match` keeps its suites under `cases`, not under any of the fields above, so
+        # a module-level `match ...: case _: import torch` walked straight past.
+        for case in getattr(node, "cases", []) or []:
+            yield from _module_level_statements(case.body)
 
 
 def _module_level_heavy_imports(path):
