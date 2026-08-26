@@ -413,6 +413,8 @@ class _Visitor(ast.NodeVisitor):
         to something that is not a built string clears it, so this does not accumulate
         false positives.
         """
+        for target in node.targets:
+            self._shadow_assignment(target, node.value)
         reason = _is_interpolated(node.value)
         # Runtime order, not source order. The right hand side is evaluated first,
         # then the targets are assigned left to right, and a target that is not a
@@ -501,6 +503,26 @@ class _Visitor(ast.NodeVisitor):
 
     visit_AsyncFor = visit_For
 
+    def visit_With(self, node: ast.With):
+        """`with ... as payload:` rebinds unconditionally before the body runs.
+
+        Reaching the body means every `as` target was assigned, so
+        `payload = f"import {user}"` followed by
+        `with nullcontext("import os") as payload: exec(payload)` executes the literal.
+        Same statement-level rebinding already accepted for `def`, `class` and `import`.
+        The context expression is visited first, since it is evaluated first.
+        """
+        for item in node.items:
+            self.visit(item.context_expr)
+            if item.optional_vars is not None:
+                self.visit(item.optional_vars)
+                self._bind_unpacked(item.optional_vars, None)
+                self._bind(item.optional_vars, None)
+        for statement in node.body:
+            self.visit(statement)
+
+    visit_AsyncWith = visit_With
+
     def visit_NamedExpr(self, node: ast.NamedExpr):
         """`(payload := f"import {name}")` as a statement, then `exec(payload)`.
 
@@ -581,12 +603,48 @@ class _Visitor(ast.NodeVisitor):
         as the `def`/`class` rebinding, so it gets the same treatment.
         """
         for alias in node.names:
-            if alias.name == "builtins" and alias.asname:
-                self.sink_aliases[-1][f"module:{alias.asname}"] = "builtins"
             bound = alias.asname or alias.name.split(".")[0]
             self.tainted[-1].pop(bound, None)
-            self._shadow_sink(bound)
+            if alias.name == "builtins" and alias.asname:
+                # This import IS the builtins binding, so it must register rather than
+                # shadow; clearing first and registering after wiped it out.
+                self._shadow_sink(bound)
+                self.sink_aliases[-1][f"module:{bound}"] = "builtins"
+            else:
+                self._shadow_sink(bound)
         self.generic_visit(node)
+
+    def _shadow_assignment(self, target: ast.AST, value: ast.AST) -> None:
+        """Record `compile = re.compile`, which makes the bare name not the builtin.
+
+        Only a plain name target, and only when the value is not itself a reference to
+        the same builtin, so `exec = exec` and `exec = builtins.exec` keep resolving to
+        the sink. Deliberately not chased any further than that: this checker does not
+        follow value flow, and something like `exec = getattr(builtins, "exec")` is
+        obfuscation rather than the good-faith code this gate exists to protect.
+        """
+        if not isinstance(target, ast.Name) or target.id not in SINKS:
+            return
+        if _sink_name(value, self._alias) is not None:
+            self.shadowed_sinks[-1].discard(target.id)
+            return
+        self.shadowed_sinks[-1].add(target.id)
+
+    def _shadow_assignment(self, target: ast.AST, value: ast.AST) -> None:
+        """Record `compile = re.compile`, which makes the bare name not the builtin.
+
+        Only a plain name target, and only when the value is not itself a reference to
+        the same builtin, so `exec = exec` and `exec = builtins.exec` keep resolving to
+        the sink. Deliberately not chased any further than that: this checker does not
+        follow value flow, and something like `exec = getattr(builtins, "exec")` is
+        obfuscation rather than the good-faith code this gate exists to protect.
+        """
+        if not isinstance(target, ast.Name) or target.id not in SINKS:
+            return
+        if _sink_name(value, self._alias) is not None:
+            self.shadowed_sinks[-1].discard(target.id)
+            return
+        self.shadowed_sinks[-1].add(target.id)
 
     def _shadow_sink(self, name: str) -> None:
         """Record that `name` was bound to something that is not the builtin.
@@ -600,6 +658,9 @@ class _Visitor(ast.NodeVisitor):
         if name in SINKS:
             self.shadowed_sinks[-1].add(name)
         self.sink_aliases[-1].pop(name, None)
+        # `import builtins as b` is stored under `module:b`, so dropping only the plain
+        # spelling left `import re as b` still resolving `b.compile` to the builtin.
+        self.sink_aliases[-1].pop(f"module:{name}", None)
 
     def visit_Lambda(self, node: ast.Lambda):
         """A lambda parameter shadows the enclosing name for the body.
@@ -625,7 +686,8 @@ class _Visitor(ast.NodeVisitor):
             self.visit(default)
         shadowed = {
             arg.arg
-            for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs, args.vararg, args.kwarg)
+            for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs,
+                        args.vararg, args.kwarg)
             if arg is not None
         }
         saved = dict(self.tainted[-1])
@@ -799,22 +861,31 @@ def _magic_argument(rest: str) -> str:
 # was the wrong tool: a subscript key is an arbitrary Python string. `_capture_target`
 # asks CPython whether the text is a valid assignment target, which is exactly the
 # question, and `(?!=)` keeps `x = y != z` out.
-_CAPTURE = re.compile(r"^(\s*)(.+?)\s*=\s*([!%])(?!=)(.*)$")
+_CAPTURE = re.compile(r"^(\s*)(.*?)=\s*([!%])(?!=)(.*)$")
 
 
 def _capture_target(line: str):
-    """`(indent, target, operator, rest)` for an IPython capture assignment, or None."""
-    match = _CAPTURE.match(line)
-    if match is None:
-        return None
-    indent, target, operator, rest = match.groups()
-    try:
-        tree = ast.parse(f"{target} = None")
-    except (SyntaxError, ValueError):
-        return None
-    if len(tree.body) != 1 or not isinstance(tree.body[0], ast.Assign):
-        return None
-    return indent, target, operator, rest, tree.body[0].targets
+    """`(indent, target, operator, rest, targets)` for a capture assignment, or None.
+
+    Every `=` that is followed by `!` or `%` is tried in turn, shortest first, and the
+    first one whose left hand side parses as an assignment target wins. A single
+    non-greedy match stopped at the `=` inside a key like `outputs["=!log"]` and gave
+    up on a line that is perfectly valid IPython.
+    """
+    for match in re.finditer(r"=\s*([!%])(?!=)", line):
+        head, operator = line[: match.start()], match.group(1)
+        indent = head[: len(head) - len(head.lstrip())]
+        target = head.strip()
+        if not target:
+            continue
+        try:
+            tree = ast.parse(f"{target} = None")
+        except (SyntaxError, ValueError):
+            continue
+        if len(tree.body) != 1 or not isinstance(tree.body[0], ast.Assign):
+            continue
+        return indent, target, operator, line[match.end():], tree.body[0].targets
+    return None
 
 
 def _string_open_lines(source: str) -> frozenset:
@@ -906,14 +977,17 @@ def _neutralised(source: str) -> str:
                 # one scalar against a tuple, which nothing can pair up, so a
                 # `payload` built before the capture kept its stale reason. Chained
                 # targets bind each name to None and say exactly what happened.
-                names = sorted(
-                    {
-                        child.id
-                        for node in _targets
-                        for child in ast.walk(node)
-                        if isinstance(child, ast.Name)
-                    }
-                )
+                #
+                # Store context only. `outputs[payload] = !cmd` READS `payload` to
+                # index with; it does not rebind it, and clearing it there turned this
+                # cleanup into a bypass.
+                names = sorted({
+                    child.id
+                    for node in _targets
+                    for child in ast.walk(node)
+                    if isinstance(child, ast.Name)
+                    and isinstance(child.ctx, ast.Store)
+                })
                 left = " = ".join(names) if names else target
                 out.append(f"{indent}{left} = None")
             continuing = line.rstrip().endswith("\\")
@@ -923,6 +997,22 @@ def _neutralised(source: str) -> str:
             continuing = line.rstrip().endswith("\\")
             continue
         stripped = line.lstrip()
+        automagic = stripped.split(maxsplit = 1)[0] if stripped else ""
+        if automagic in _CODE_MAGICS and not stripped.startswith(("%", "!")):
+            # IPython's automagic lets `timeit exec(payload)` run the sink without a
+            # leading `%`. The raw cell does not parse and nothing here rewrote the
+            # line, so the cell was skipped along with the sink. Only rewritten when
+            # the remainder is Python, so an ordinary `capture = 1` is untouched.
+            indent = line[: len(line) - len(stripped)]
+            argument = _magic_argument(stripped.split(maxsplit = 1)[1])
+            try:
+                ast.parse(argument)
+            except (SyntaxError, ValueError):
+                pass
+            else:
+                out.append(indent + argument)
+                continuing = line.rstrip().endswith("\\")
+                continue
         if stripped.startswith(("%", "!")):
             indent = line[: len(line) - len(stripped)]
             # A line magic that takes code keeps its argument; the magic itself is not
@@ -938,10 +1028,6 @@ def _neutralised(source: str) -> str:
         else:
             out.append(line)
     return "\n".join(out)
-
-
-# `%%script` options that take their value in the following token.
-_SCRIPT_VALUE_OPTIONS = ("--out", "--err", "--proc")
 
 
 def _runs_python(argument: str) -> bool:
@@ -966,7 +1052,18 @@ def _runs_python(argument: str) -> bool:
             else:
                 index += 1
             continue
-        return token.rsplit("/", 1)[-1].split("\\")[-1].startswith("python")
+        command = token.rsplit("/", 1)[-1].split("\\")[-1]
+        if command == "env":
+            # `%%script /usr/bin/env python` reaches Python through a wrapper. Its own
+            # options and any `NAME=value` assignments come first, so they are stepped
+            # over before the real command is read.
+            index += 1
+            while index < len(tokens) and (
+                tokens[index].startswith("-") or "=" in tokens[index]
+            ):
+                index += 1
+            continue
+        return command.startswith("python")
     return False
 
 
@@ -990,10 +1087,14 @@ def _foreign_cell_magic(code: str) -> str | None:
         magic, _, argument = line[2:].strip().partition(" ")
         if magic in _CODE_MAGICS or magic in ("python", "python3"):
             return None
-        if magic in ("script", "bash") and _runs_python(argument):
+        if magic == "script" and _runs_python(argument):
             # `%%script python` hands the body to a Python interpreter, so it is
             # Python and has to be scanned. Reading only the magic name classified it
             # as foreign and skipped the cell entirely.
+            #
+            # `%%script` only. `%%bash` runs bash whatever its argument says, so
+            # letting `%%bash python` through here reported shell text that happened
+            # to parse as Python.
             return None
         return magic
     return None
