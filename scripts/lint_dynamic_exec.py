@@ -227,13 +227,14 @@ def _is_interpolated(node: ast.AST, resolve = None) -> str | None:
     return None
 
 
-def _sink_name(function: ast.AST, aliases: dict | None = None) -> str | None:
+def _sink_name(function: ast.AST, aliases = None) -> str | None:
     """The sink this call target names, if any.
 
     Both `exec(...)` and `builtins.exec(...)` execute. Matching only `ast.Name` meant
     the second form passed the lint with zero findings.
 
-    `aliases` maps a local name to the sink it was imported as. `from builtins import
+    `aliases` resolves a local name to the sink it was imported as, innermost scope
+    first, or returns None. `from builtins import
     exec as run` gives `run` the same builtin, so reading only the spelling at the call
     site missed it. Only names bound by an import from `builtins` are recorded, which
     keeps this to a fact stated in the file rather than a guess about what a name holds.
@@ -241,12 +242,12 @@ def _sink_name(function: ast.AST, aliases: dict | None = None) -> str | None:
     if isinstance(function, ast.Name):
         if function.id in SINKS:
             return function.id
-        if aliases and function.id in aliases:
-            return aliases[function.id]
+        if aliases is not None and aliases(function.id):
+            return aliases(function.id)
     if isinstance(function, ast.Attribute) and function.attr in SINKS:
         if isinstance(function.value, ast.Name):
             module = function.value.id
-            if module == "builtins" or (aliases or {}).get(f"module:{module}"):
+            if module == "builtins" or (aliases is not None and aliases(f"module:{module}")):
                 return f"builtins.{function.attr}"
     return None
 
@@ -290,9 +291,30 @@ class _Visitor(ast.NodeVisitor):
         self.tainted: list[dict[str, str]] = [{}]
         # Local name -> the sink it names, for `from builtins import exec as run` and
         # `import builtins as b`. One flat map: an import binds for the whole module.
-        self.sink_aliases: dict[str, str] = {}
+        self.sink_aliases: list[dict[str, str]] = [{}]
         # Sink names this file rebound to something else, e.g. `from re import compile`.
-        self.shadowed_sinks: set[str] = set()
+        self.shadowed_sinks: list[set[str]] = [set()]
+
+    def _alias(self, name: str) -> str | None:
+        """The sink `name` resolves to through an import, innermost scope first."""
+        for scope in reversed(self.sink_aliases):
+            if name in scope:
+                return scope[name]
+        return None
+
+    def _is_shadowed(self, name: str) -> bool:
+        """Whether `name` was rebound away from the builtin, innermost scope first.
+
+        Innermost wins in both directions, so a function parameter or local import
+        that shadows an outer `from builtins import exec as run` is honoured rather
+        than inheriting it.
+        """
+        for scope, aliases in zip(reversed(self.shadowed_sinks), reversed(self.sink_aliases)):
+            if name in aliases:
+                return False
+            if name in scope:
+                return True
+        return False
 
     def _qualname(self) -> str:
         inner = ".".join(self.scope) if self.scope else "<module>"
@@ -346,8 +368,24 @@ class _Visitor(ast.NodeVisitor):
         # A fresh scope: a name built in one function says nothing about the same name
         # in another.
         self.tainted.append({})
+        # Aliases are lexical too: a `from builtins import exec as run` inside one
+        # function said nothing about a `run` parameter in the next one. Parameters
+        # shadow, so they are recorded as rebindings for this scope.
+        self.sink_aliases.append({})
+        self.shadowed_sinks.append(set())
+        if not isinstance(node, ast.ClassDef):
+            arguments = node.args
+            for argument in (
+                *arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs,
+                arguments.vararg, arguments.kwarg,
+            ):
+                if argument is not None and argument.arg in SINKS:
+                    self.shadowed_sinks[-1].add(argument.arg)
+        self._collect_aliases(node.body)
         for statement in node.body:
             self.visit(statement)
+        self.sink_aliases.pop()
+        self.shadowed_sinks.pop()
         self.tainted.pop()
         self.scope.pop()
         self.scope_kinds.pop()
@@ -503,13 +541,29 @@ class _Visitor(ast.NodeVisitor):
         else:
             self.tainted[-1][target.id] = f"{reason} via `{target.id}`"
 
+    def _collect_aliases(self, body) -> None:
+        """Record the sink aliases a scope's own imports bind, before walking it.
+
+        An import binds for the whole scope, not from its line downwards, so
+        `def use(name): run(f"import {name}")` followed at module level by
+        `from builtins import exec as run` really does execute interpolated source.
+        Resolving in traversal order missed it. Only the statements directly in this
+        scope are read; nested scopes collect their own.
+        """
+        for statement in body:
+            if isinstance(statement, ast.ImportFrom):
+                if statement.module == "builtins" and not statement.level:
+                    for alias in statement.names:
+                        if alias.name in SINKS:
+                            self.sink_aliases[-1][alias.asname or alias.name] = alias.name
+
     def visit_ImportFrom(self, node: ast.ImportFrom):
         """`from builtins import exec as run` makes `run` the same builtin."""
         for alias in node.names:
             bound = alias.asname or alias.name
             if node.module == "builtins" and not node.level and alias.name in SINKS:
-                self.sink_aliases[bound] = alias.name
-                self.shadowed_sinks.discard(bound)
+                self.sink_aliases[-1][bound] = alias.name
+                self.shadowed_sinks[-1].discard(bound)
             else:
                 self.tainted[-1].pop(bound, None)
                 self._shadow_sink(bound)
@@ -525,7 +579,7 @@ class _Visitor(ast.NodeVisitor):
         """
         for alias in node.names:
             if alias.name == "builtins" and alias.asname:
-                self.sink_aliases[f"module:{alias.asname}"] = "builtins"
+                self.sink_aliases[-1][f"module:{alias.asname}"] = "builtins"
             bound = alias.asname or alias.name.split(".")[0]
             self.tainted[-1].pop(bound, None)
             self._shadow_sink(bound)
@@ -541,8 +595,8 @@ class _Visitor(ast.NodeVisitor):
         the builtin explicitly rather than through the shadowed name.
         """
         if name in SINKS:
-            self.shadowed_sinks.add(name)
-        self.sink_aliases.pop(name, None)
+            self.shadowed_sinks[-1].add(name)
+        self.sink_aliases[-1].pop(name, None)
 
     def visit_Lambda(self, node: ast.Lambda):
         """A lambda parameter shadows the enclosing name for the body.
@@ -558,6 +612,10 @@ class _Visitor(ast.NodeVisitor):
         does, would trade this false positive for a false negative. The asymmetry with
         `_enter` is the existing documented limit on cross-scope taint, not something
         introduced here.
+
+        Whatever the body binds is discarded afterwards, because a lambda is a
+        function scope: a walrus inside it binds locally, so letting those bindings
+        survive reported outer names the lambda never touched.
         """
         args = node.args
         for default in (*args.defaults, *(d for d in args.kw_defaults if d is not None)):
@@ -567,13 +625,61 @@ class _Visitor(ast.NodeVisitor):
             for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs, args.vararg, args.kwarg)
             if arg is not None
         }
-        saved = {name: self.tainted[-1].pop(name) for name in shadowed if name in self.tainted[-1]}
+        saved = dict(self.tainted[-1])
+        for name in shadowed:
+            self.tainted[-1].pop(name, None)
         self.visit(node.body)
+        # A lambda IS a function scope, so a walrus in its body binds locally and
+        # nothing it does reaches the enclosing map. Restoring the parameters alone
+        # left those local bindings behind, which reported a clean outer name.
+        self.tainted[-1] = saved
+
+    def _visit_comprehension(self, node):
+        """A comprehension target is local to the comprehension.
+
+        `payload = f"import {name}"` followed by
+        `[exec(payload) for payload in ["import os"]]` executes only the literal, but
+        the sink was read against the enclosing map and the outer reason was still
+        there. The outermost iterable really is evaluated in the enclosing scope, so it
+        is visited first, and the target names are then lifted for the rest.
+
+        A walrus inside a comprehension binds in the ENCLOSING scope, unlike one inside
+        a lambda, so the map is not snapshotted wholesale here: only the target names
+        are removed and only they are put back.
+        """
+        generators = node.generators
+        if generators:
+            self.visit(generators[0].iter)
+        targets = {
+            child.id
+            for generator in generators
+            for child in ast.walk(generator.target)
+            if isinstance(child, ast.Name)
+        }
+        saved = {name: self.tainted[-1][name] for name in targets if name in self.tainted[-1]}
+        for name in targets:
+            self.tainted[-1].pop(name, None)
+        for index, generator in enumerate(generators):
+            if index:
+                self.visit(generator.iter)
+            for condition in generator.ifs:
+                self.visit(condition)
+        for field in ("elt", "key", "value"):
+            child = getattr(node, field, None)
+            if child is not None:
+                self.visit(child)
+        for name in targets:
+            self.tainted[-1].pop(name, None)
         self.tainted[-1].update(saved)
 
+    visit_ListComp = _visit_comprehension
+    visit_SetComp = _visit_comprehension
+    visit_DictComp = _visit_comprehension
+    visit_GeneratorExp = _visit_comprehension
+
     def visit_Call(self, node: ast.Call):
-        sink = _sink_name(node.func, self.sink_aliases)
-        if isinstance(node.func, ast.Name) and node.func.id in self.shadowed_sinks:
+        sink = _sink_name(node.func, self._alias)
+        if isinstance(node.func, ast.Name) and self._is_shadowed(node.func.id):
             sink = None
         argument = _source_argument(node, sink) if sink is not None else None
         if argument is not None:
@@ -938,6 +1044,7 @@ def _scan_notebook(path: Path) -> list[dict]:
             continue
         if _annotations_deferred(tree):
             visitor.annotations_deferred = True
+        visitor._collect_aliases(tree.body)
         visitor.qualname_prefix = f"cell{index}"
         try:
             visitor.visit(tree)
@@ -992,6 +1099,7 @@ def scan_file(path: Path) -> list[dict]:
         ) from None
     visitor = _Visitor(path)
     visitor.annotations_deferred = _annotations_deferred(tree)
+    visitor._collect_aliases(tree.body)
     try:
         visitor.visit(tree)
     except RecursionError:
