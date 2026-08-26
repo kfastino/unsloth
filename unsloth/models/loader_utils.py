@@ -532,13 +532,37 @@ def _get_new_mapper():
         byte_cap = 10_000_000
         deadline = time.monotonic() + 10
         chunks, total = [], 0
-        with requests.get(new_mapper, timeout = 3, stream = True) as response:
-            for chunk in response.iter_content(chunk_size = 65_536):
-                chunks.append(chunk)
-                total += len(chunk)
-                if total > byte_cap or time.monotonic() > deadline:
-                    return {}, {}, {}, {}, {}
-            encoding = response.encoding or "utf-8"
+        # Redirects are followed by hand. `requests` otherwise follows them inside
+        # `get`, and drains each intermediate body so the connection can be reused,
+        # which happens before `stream = True` hands anything to the loop below - so a
+        # 3xx with an enormous or endlessly trickled body would slip past both limits.
+        # Following them here keeps every hop under the same cap and deadline.
+        url = new_mapper
+        for _ in range(5):
+            response = requests.get(url, timeout = 3, stream = True, allow_redirects = False)
+            with response:
+                location = response.headers.get("location") if (
+                    300 <= response.status_code < 400
+                ) else None
+                if location is not None:
+                    # A redirect body is not read at all: closing releases the
+                    # connection without draining it, so an oversized or endlessly
+                    # trickled 3xx costs nothing. Only the deadline applies here.
+                    if time.monotonic() > deadline:
+                        return {}, {}, {}, {}, {}
+                else:
+                    for chunk in response.iter_content(chunk_size = 65_536):
+                        chunks.append(chunk)
+                        total += len(chunk)
+                        if total > byte_cap or time.monotonic() > deadline:
+                            return {}, {}, {}, {}, {}
+                    encoding = response.encoding or "utf-8"
+            if location is None:
+                break
+            url = requests.compat.urljoin(url, location)
+        else:
+            # Too many hops. Same answer as every other failure here.
+            return {}, {}, {}, {}, {}
         new_mapper = b"".join(chunks).decode(encoding, errors = "replace")
         # Never exec the response. This is a plain HTTPS GET, so the body is whatever
         # the endpoint served, and exec'ing it would make any compromise of that path

@@ -20,6 +20,7 @@ blocks non-loopback sockets anyway.
 """
 
 import builtins
+import types
 from contextlib import contextmanager
 
 import pytest
@@ -39,11 +40,15 @@ class _Response:
 
     The probe reads in chunks and stops at its byte cap while reading, because
     `requests.get` would otherwise buffer and decode the whole body before any length
-    check could run. A fake offering only `.text` would let that regress silently.
+    check could run. It also follows redirects itself, since `requests` drains each
+    intermediate body inside `get`, so a status and headers are needed as well.
+    A fake offering only `.text` would let either of those regress silently.
     """
 
-    def __init__(self, text):
+    def __init__(self, text, status_code = 200, headers = None):
         self.encoding = "utf-8"
+        self.status_code = status_code
+        self.headers = headers or {}
         self._body = text.encode("utf-8")
 
     def iter_content(self, chunk_size = 1):
@@ -62,6 +67,8 @@ def _serving(body, monkeypatch):
     import requests
 
     monkeypatch.setattr(requests, "get", lambda *a, **k: _Response(body))
+    if not hasattr(requests, "compat"):
+        monkeypatch.setattr(requests, "compat", types.SimpleNamespace(urljoin = lambda b, u: u))
     yield
 
 

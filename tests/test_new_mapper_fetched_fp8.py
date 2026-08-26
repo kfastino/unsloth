@@ -81,16 +81,15 @@ class _FakeResponse:
 
     `_get_new_mapper` reads the body in chunks and stops at its byte cap while
     reading, because `requests.get` would otherwise buffer and decode the whole
-    response before any length check could run. A fake that only offers `.text`
-    would let that regress silently, so this models `iter_content` instead.
+    response before any length check could run. It also follows redirects by hand,
+    since `requests` drains each intermediate body inside `get`, so the fake has to
+    carry a status and headers as well as `iter_content`.
     """
 
-    def __init__(
-        self,
-        text,
-        chunks = None,
-    ):
+    def __init__(self, text, chunks = None, status_code = 200, headers = None):
         self.encoding = "utf-8"
+        self.status_code = status_code
+        self.headers = headers or {}
         self._chunks = chunks if chunks is not None else [text.encode("utf-8")]
 
     def iter_content(self, chunk_size = 1):
@@ -103,13 +102,12 @@ class _FakeResponse:
         return False
 
 
-def _install_fake_requests(
-    monkeypatch,
-    text,
-    chunks = None,
-):
+def _install_fake_requests(monkeypatch, text, chunks = None):
     module = types.ModuleType("requests")
-    module.get = lambda url, timeout = None, stream = False: _FakeResponse(text, chunks)
+    module.compat = types.SimpleNamespace(urljoin = lambda base, url: url)
+    module.get = lambda url, timeout = None, stream = False, allow_redirects = True: (
+        _FakeResponse(text, chunks)
+    )
     monkeypatch.setitem(sys.modules, "requests", module)
 
 

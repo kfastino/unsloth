@@ -54,16 +54,15 @@ class _FakeResponse:
 
     `_get_new_mapper` reads the body in chunks and stops at its byte cap while
     reading, because `requests.get` would otherwise buffer and decode the whole
-    response before any length check could run. A fake that only offers `.text`
-    would let that regress silently, so this models `iter_content` instead.
+    response before any length check could run. It also follows redirects by hand,
+    since `requests` drains each intermediate body inside `get`, so the fake has to
+    carry a status and headers as well as `iter_content`.
     """
 
-    def __init__(
-        self,
-        text,
-        chunks = None,
-    ):
+    def __init__(self, text, chunks = None, status_code = 200, headers = None):
         self.encoding = "utf-8"
+        self.status_code = status_code
+        self.headers = headers or {}
         self._chunks = chunks if chunks is not None else [text.encode("utf-8")]
 
     def iter_content(self, chunk_size = 1):
@@ -76,13 +75,12 @@ class _FakeResponse:
         return False
 
 
-def _install_fake_requests(
-    monkeypatch,
-    text,
-    chunks = None,
-):
+def _install_fake_requests(monkeypatch, text, chunks = None):
     module = types.ModuleType("requests")
-    module.get = lambda url, timeout = None, stream = False: _FakeResponse(text, chunks)
+    module.compat = types.SimpleNamespace(urljoin = lambda base, url: url)
+    module.get = lambda url, timeout = None, stream = False, allow_redirects = True: (
+        _FakeResponse(text, chunks)
+    )
     monkeypatch.setitem(sys.modules, "requests", module)
 
 
@@ -152,3 +150,50 @@ def test_the_byte_cap_stops_the_read_instead_of_measuring_it_afterwards(monkeypa
     # 10MB at 64KB a chunk is about 160 chunks; anything near the guard above means the
     # cap is not being enforced while reading.
     assert len(served) < 200, len(served)
+
+
+def test_a_redirect_body_is_bounded_too(monkeypatch):
+    """`requests` drains an intermediate 3xx body inside `get`, before `stream=True`
+    hands anything to the caller, so a redirect was a way around the cap and the
+    deadline. The probe follows redirects itself for that reason; this pins it."""
+    served = []
+
+    def endless():
+        while True:
+            served.append(1)
+            if len(served) > 5_000:
+                raise AssertionError("the probe kept reading a redirect body past its cap")
+            yield b"x" * 65_536
+
+    # A redirect body must not be read at all, so `served` should stay empty.
+
+    module = types.ModuleType("requests")
+    module.compat = types.SimpleNamespace(urljoin = lambda base, url: url)
+    module.get = lambda url, timeout = None, stream = False, allow_redirects = True: (
+        _FakeResponse("", chunks = endless(), status_code = 302,
+                      headers = {"location": "https://example.invalid/next"})
+    )
+    monkeypatch.setitem(sys.modules, "requests", module)
+
+    get_new_mapper = _extract_get_new_mapper({})
+    assert get_new_mapper() == ({}, {}, {}, {}, {})
+    assert not served, len(served)
+
+
+def test_a_redirect_loop_ends(monkeypatch):
+    """A peer that redirects forever must not keep the probe going forever."""
+    hops = []
+
+    module = types.ModuleType("requests")
+    module.compat = types.SimpleNamespace(urljoin = lambda base, url: url)
+
+    def get(url, timeout = None, stream = False, allow_redirects = True):
+        hops.append(url)
+        assert len(hops) < 50, "the probe followed redirects without a hop limit"
+        return _FakeResponse("", status_code = 302, headers = {"location": url})
+
+    module.get = get
+    monkeypatch.setitem(sys.modules, "requests", module)
+
+    get_new_mapper = _extract_get_new_mapper({})
+    assert get_new_mapper() == ({}, {}, {}, {}, {})
