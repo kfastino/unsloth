@@ -295,11 +295,26 @@ class _Visitor(ast.NodeVisitor):
         # Sink names this file rebound to something else, e.g. `from re import compile`.
         self.shadowed_sinks: list[set[str]] = [set()]
 
+    def _visible_scopes(self):
+        """Scope indices a name lookup here may consult, innermost first.
+
+        A class body is not a lexical scope for the functions defined inside it: a
+        method does not close over class locals, so `class C: from re import compile`
+        does not make a bare `compile` inside `C.f` anything other than the builtin.
+        Treating every enclosing scope alike let a class-body import suppress a real
+        finding in a method. The innermost scope is always visible, which is what keeps
+        code written directly in the class body working.
+        """
+        for index in range(len(self.sink_aliases) - 1, -1, -1):
+            if index != len(self.sink_aliases) - 1 and self.scope_kinds[index] == "class":
+                continue
+            yield index
+
     def _alias(self, name: str) -> str | None:
         """The sink `name` resolves to through an import, innermost scope first."""
-        for scope in reversed(self.sink_aliases):
-            if name in scope:
-                return scope[name]
+        for index in self._visible_scopes():
+            if name in self.sink_aliases[index]:
+                return self.sink_aliases[index][name]
         return None
 
     def _is_shadowed(self, name: str) -> bool:
@@ -309,10 +324,10 @@ class _Visitor(ast.NodeVisitor):
         that shadows an outer `from builtins import exec as run` is honoured rather
         than inheriting it.
         """
-        for scope, aliases in zip(reversed(self.shadowed_sinks), reversed(self.sink_aliases)):
-            if name in aliases:
+        for index in self._visible_scopes():
+            if name in self.sink_aliases[index]:
                 return False
-            if name in scope:
+            if name in self.shadowed_sinks[index]:
                 return True
         return False
 
@@ -364,7 +379,9 @@ class _Visitor(ast.NodeVisitor):
             self.visit(part)
 
         self.scope.append(node.name)
-        self.scope_kinds.append("class" if isinstance(node, ast.ClassDef) else "function")
+        self.scope_kinds.append(
+            "class" if isinstance(node, ast.ClassDef) else "function"
+        )
         # A fresh scope: a name built in one function says nothing about the same name
         # in another.
         self.tainted.append({})
@@ -376,14 +393,18 @@ class _Visitor(ast.NodeVisitor):
         if not isinstance(node, ast.ClassDef):
             arguments = node.args
             for argument in (
-                *arguments.posonlyargs,
-                *arguments.args,
-                *arguments.kwonlyargs,
-                arguments.vararg,
-                arguments.kwarg,
+                *arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs,
+                arguments.vararg, arguments.kwarg,
             ):
-                if argument is not None and argument.arg in SINKS:
+                if argument is None:
+                    continue
+                # A parameter shadows whatever the name meant outside, so it has to
+                # cover an alias as well as the literal spelling: with
+                # `from builtins import exec as run` at module level, `def f(run, x)`
+                # supplies its own `run`.
+                if argument.arg in SINKS or self._alias(argument.arg):
                     self.shadowed_sinks[-1].add(argument.arg)
+                    self.sink_aliases[-1].pop(argument.arg, None)
         self._collect_aliases(node.body)
         for statement in node.body:
             self.visit(statement)
@@ -503,6 +524,26 @@ class _Visitor(ast.NodeVisitor):
 
     visit_AsyncFor = visit_For
 
+    def visit_ExceptHandler(self, node: ast.ExceptHandler):
+        """`except Exception as payload:` rebinds, and then deletes, the name.
+
+        Inside the handler `payload` is necessarily the exception object, so a reason
+        carried in from before the `try` was stale. Python also unbinds the name when
+        the handler exits, so it is cleared on the way out as well rather than
+        restored.
+        """
+        if node.type is not None:
+            self.visit(node.type)
+        if node.name is not None:
+            self.tainted[-1].pop(node.name, None)
+            if node.name in SINKS or self._alias(node.name):
+                self.shadowed_sinks[-1].add(node.name)
+        for statement in node.body:
+            self.visit(statement)
+        if node.name is not None:
+            self.tainted[-1].pop(node.name, None)
+            self.shadowed_sinks[-1].discard(node.name)
+
     def visit_With(self, node: ast.With):
         """`with ... as payload:` rebinds unconditionally before the body runs.
 
@@ -581,6 +622,13 @@ class _Visitor(ast.NodeVisitor):
                     for alias in statement.names:
                         if alias.name in SINKS:
                             self.sink_aliases[-1][alias.asname or alias.name] = alias.name
+            elif isinstance(statement, ast.Import):
+                # The module form binds for the whole scope too, so
+                # `def f(x): b.exec(f"import {x}")` above `import builtins as b` is
+                # still a finding.
+                for alias in statement.names:
+                    if alias.name == "builtins" and alias.asname:
+                        self.sink_aliases[-1][f"module:{alias.asname}"] = "builtins"
 
     def visit_ImportFrom(self, node: ast.ImportFrom):
         """`from builtins import exec as run` makes `run` the same builtin."""
@@ -723,6 +771,17 @@ class _Visitor(ast.NodeVisitor):
         saved = {name: self.tainted[-1][name] for name in targets if name in self.tainted[-1]}
         for name in targets:
             self.tainted[-1].pop(name, None)
+        # Lifting the inherited reason is only half of it. The target is also BOUND
+        # from the iterable, exactly as in `visit_For`, and leaving that out meant
+        # `[exec(payload) for payload in [f"import {name}"]]` reported nothing at all.
+        for generator in generators:
+            if isinstance(generator.iter, (ast.Tuple, ast.List)) and generator.iter.elts:
+                reasons = [_is_interpolated(element) for element in generator.iter.elts]
+                self._bind(generator.target, next((r for r in reasons if r is not None), None))
+        # A target named after a sink shadows it for the comprehension, the same way a
+        # parameter does: `[exec(...) for exec in callbacks]` calls the callback.
+        shadowed = {name for name in targets if name in SINKS or self._alias(name)}
+        self.shadowed_sinks[-1].update(shadowed)
         for index, generator in enumerate(generators):
             if index:
                 self.visit(generator.iter)
@@ -735,6 +794,7 @@ class _Visitor(ast.NodeVisitor):
         for name in targets:
             self.tainted[-1].pop(name, None)
         self.tainted[-1].update(saved)
+        self.shadowed_sinks[-1].difference_update(shadowed)
 
     visit_ListComp = _visit_comprehension
     visit_SetComp = _visit_comprehension
@@ -949,9 +1009,13 @@ def _neutralised(source: str) -> str:
     onto the following physical lines, and those are blanked too - otherwise ordinary
     Python further down the same cell was thrown away with the shell command.
     """
-    out, continuing = [], False
+    out, continuing, skip = [], False, 0
     in_string = _string_open_lines(source)
-    for number, line in enumerate(source.splitlines()):
+    lines = source.splitlines()
+    for number, line in enumerate(lines):
+        if skip:
+            skip -= 1
+            continue
         if number in in_string:
             out.append(line)
             continuing = False
@@ -1019,6 +1083,25 @@ def _neutralised(source: str) -> str:
             # Python but what follows it is, and dropping the line hid the sink.
             if stripped.startswith("%") and not stripped.startswith("%%"):
                 magic, _, rest = stripped[1:].partition(" ")
+                if magic in _CODE_MAGICS and line.rstrip().endswith("\\"):
+                    # `%timeit \` puts the Python on the following physical lines.
+                    # Emitting the backslash and blanking what followed threw the sink
+                    # away, so the continuation is joined here and read as the
+                    # argument. The lines it consumed become blanks to keep the
+                    # numbering.
+                    joined, consumed = [], 0
+                    while number + consumed < len(lines):
+                        piece = lines[number + consumed].rstrip()
+                        joined.append(piece.removesuffix("\\"))
+                        consumed += 1
+                        if not piece.endswith("\\"):
+                            break
+                    argument = _magic_argument(" ".join(joined).lstrip()[len(magic) + 1:])
+                    out.append(indent + argument)
+                    out.extend([""] * (consumed - 1))
+                    skip = consumed - 1
+                    continuing = False
+                    continue
                 if magic in _CODE_MAGICS and rest.strip():
                     out.append(indent + _magic_argument(rest))
                     continuing = line.rstrip().endswith("\\")
