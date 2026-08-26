@@ -686,8 +686,7 @@ class _Visitor(ast.NodeVisitor):
             self.visit(default)
         shadowed = {
             arg.arg
-            for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs,
-                        args.vararg, args.kwarg)
+            for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs, args.vararg, args.kwarg)
             if arg is not None
         }
         saved = dict(self.tainted[-1])
@@ -884,7 +883,7 @@ def _capture_target(line: str):
             continue
         if len(tree.body) != 1 or not isinstance(tree.body[0], ast.Assign):
             continue
-        return indent, target, operator, line[match.end():], tree.body[0].targets
+        return indent, target, operator, line[match.end() :], tree.body[0].targets
     return None
 
 
@@ -981,13 +980,14 @@ def _neutralised(source: str) -> str:
                 # Store context only. `outputs[payload] = !cmd` READS `payload` to
                 # index with; it does not rebind it, and clearing it there turned this
                 # cleanup into a bypass.
-                names = sorted({
-                    child.id
-                    for node in _targets
-                    for child in ast.walk(node)
-                    if isinstance(child, ast.Name)
-                    and isinstance(child.ctx, ast.Store)
-                })
+                names = sorted(
+                    {
+                        child.id
+                        for node in _targets
+                        for child in ast.walk(node)
+                        if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store)
+                    }
+                )
                 left = " = ".join(names) if names else target
                 out.append(f"{indent}{left} = None")
             continuing = line.rstrip().endswith("\\")
@@ -1058,9 +1058,7 @@ def _runs_python(argument: str) -> bool:
             # options and any `NAME=value` assignments come first, so they are stepped
             # over before the real command is read.
             index += 1
-            while index < len(tokens) and (
-                tokens[index].startswith("-") or "=" in tokens[index]
-            ):
+            while index < len(tokens) and (tokens[index].startswith("-") or "=" in tokens[index]):
                 index += 1
             continue
         return command.startswith("python")
