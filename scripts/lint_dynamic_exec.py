@@ -376,8 +376,11 @@ class _Visitor(ast.NodeVisitor):
         if not isinstance(node, ast.ClassDef):
             arguments = node.args
             for argument in (
-                *arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs,
-                arguments.vararg, arguments.kwarg,
+                *arguments.posonlyargs,
+                *arguments.args,
+                *arguments.kwonlyargs,
+                arguments.vararg,
+                arguments.kwarg,
             ):
                 if argument is not None and argument.arg in SINKS:
                     self.shadowed_sinks[-1].add(argument.arg)
