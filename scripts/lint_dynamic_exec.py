@@ -206,6 +206,10 @@ def _is_interpolated(
         # element dropped both. A starred NAME is still left alone: nothing here knows
         # what it holds, and flagging every `exec(*args)` would be noise.
         inner = node.value
+        if isinstance(inner, ast.Set) and len(inner.elts) == 1:
+            # A set has no order, so only a one-element literal says which value is
+            # spread; `exec(*{f"import {name}"})` is that.
+            return _is_interpolated(inner.elts[0], resolve, shadowed)
         if isinstance(inner, (ast.Tuple, ast.List)) and inner.elts:
             return _is_interpolated(inner.elts[0], resolve, shadowed)
         return None
@@ -655,6 +659,18 @@ class _Visitor(ast.NodeVisitor):
         if isinstance(node.iter, (ast.Tuple, ast.List)) and node.iter.elts:
             reasons = [_is_interpolated(element) for element in node.iter.elts]
             self._bind(node.target, next((r for r in reasons if r is not None), None))
+            # A tuple target takes each element APART, so the whole-element reason
+            # says nothing about it. Aggregated across elements, first reason wins,
+            # because the loop runs over all of them.
+            aggregated: dict[str, str] = {}
+            for element in node.iter.elts:
+                before = dict(self.tainted[-1])
+                self._bind_unpacked(node.target, element)
+                for key, value in self.tainted[-1].items():
+                    if before.get(key) != value:
+                        aggregated.setdefault(key, value)
+                self.tainted[-1] = before
+            self.tainted[-1].update(aggregated)
         self.visit(node.target)
         # `for exec in callbacks:` calls the callback in the body, not the builtin.
         names = {child.id for child in ast.walk(node.target) if isinstance(child, ast.Name)}
@@ -757,8 +773,18 @@ class _Visitor(ast.NodeVisitor):
                 self.visit(item.optional_vars)
                 self._bind_unpacked(item.optional_vars, None)
                 self._bind(item.optional_vars, None)
+        # `with ctx() as exec:` calls whatever the context manager handed over.
+        names = {
+            child.id
+            for item in node.items
+            if item.optional_vars is not None
+            for child in ast.walk(item.optional_vars)
+            if isinstance(child, ast.Name)
+        }
+        saved_scope = self._shadow_locals(names)
         for statement in node.body:
             self.visit(statement)
+        self._restore_locals(saved_scope)
 
     visit_AsyncWith = visit_With
 
@@ -805,6 +831,15 @@ class _Visitor(ast.NodeVisitor):
         else:
             self.tainted[-1][target.id] = f"{reason} via `{target.id}`"
 
+    @staticmethod
+    def _declared_global(body) -> set:
+        """Names this statement list declares `global`, for the pre-pass."""
+        names = set()
+        for statement in body:
+            if isinstance(statement, ast.Global):
+                names.update(statement.names)
+        return names
+
     def _collect_aliases(self, body) -> None:
         """Record the sink aliases a scope's own imports bind, before walking it.
 
@@ -842,6 +877,11 @@ class _Visitor(ast.NodeVisitor):
                 for target in targets:
                     for child in ast.walk(target):
                         if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store):
+                            # A `global` name is not a local binding at all, so it must
+                            # not be recorded as shadowing this scope - the assignment
+                            # updates the module and is handled there.
+                            if child.id in self._declared_global(body):
+                                continue
                             if self._alias(child.id) or self._alias(f"module:{child.id}"):
                                 self.shadowed_sinks[-1].add(child.id)
             else:
@@ -910,6 +950,10 @@ class _Visitor(ast.NodeVisitor):
             name in _BUILTIN_NAMES
             or self._alias(name) is not None
             or self._alias(f"module:{name}") is not None
+            # A name already recorded as shadowed still counts, so a second assignment
+            # can hand it back: `run = print` then `run = builtins.exec` has to make
+            # `run` an alias again, and by then the alias entry is gone.
+            or self._is_shadowed(name)
         )
 
     def _shadow_locals(self, names):
@@ -953,11 +997,19 @@ class _Visitor(ast.NodeVisitor):
             return
         if not self._binds_over_sink(target.id):
             return
-        if _sink_name(value, self._alias) is not None:
+        resolved = _sink_name(value, self._alias)
+        if resolved is not None:
             # `exec = builtins.exec` under `global exec` puts the builtin back at
             # module level, where the earlier `exec = print` shadow lives.
             level = 0 if target.id in self.global_names[-1] else -1
             self.shadowed_sinks[level].discard(target.id)
+            if target.id not in SINKS:
+                # `run = print` then `run = builtins.exec` has to make `run` an alias
+                # again; dropping the shadow alone left it resolving to nothing,
+                # because the first assignment had already removed the alias entry.
+                sink = resolved.rpartition(".")[2]
+                self.sink_aliases[level][target.id] = sink
+                self.collected_aliases[level][target.id] = sink
             return
         level = 0 if target.id in self.global_names[-1] else -1
         self.shadowed_sinks[level].add(target.id)
@@ -1009,12 +1061,19 @@ class _Visitor(ast.NodeVisitor):
             self.visit(default)
         shadowed = {
             arg.arg
-            for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs, args.vararg, args.kwarg)
+            for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs,
+                        args.vararg, args.kwarg)
             if arg is not None
         }
         saved = dict(self.tainted[-1])
         for name in shadowed:
             self.tainted[-1].pop(name, None)
+        if self.scope_kinds[-1] == "class":
+            # A lambda in a class body does not close over the class namespace, so
+            # `class C: payload = f"..."; fn = lambda: exec(payload)` reads a global
+            # `payload`, not the class attribute. `_visible_scopes` already hides
+            # class-local ALIASES from these implicit scopes; taint has to go too.
+            self.tainted[-1] = {}
         saved_scope = self._shadow_locals(shadowed)
         # A lambda defined in a class body does not close over the class namespace
         # either, so its body needs a real function level for `_visible_scopes` to
@@ -1061,8 +1120,12 @@ class _Visitor(ast.NodeVisitor):
             for child in ast.walk(generator.target)
             if isinstance(child, ast.Name)
         }
-        saved = {name: self.tainted[-1][name] for name in targets if name in self.tainted[-1]}
+        saved = dict(self.tainted[-1])
         saved_scope = self._shadow_locals(targets)
+        if self.scope_kinds[-1] == "class":
+            # Same as the lambda: a comprehension in a class body cannot see class
+            # locals either.
+            self.tainted[-1] = {}
         # A comprehension runs in an implicit scope of its own, so a class body around
         # it is no more visible to it than it is to a method.
         self.scope_kinds.append("function")
@@ -1113,7 +1176,7 @@ class _Visitor(ast.NodeVisitor):
         self.global_names.pop()
         for name in targets:
             self.tainted[-1].pop(name, None)
-        self.tainted[-1].update(saved)
+        self.tainted[-1] = saved
         self._restore_locals(saved_scope)
 
     visit_ListComp = _visit_comprehension
@@ -1185,11 +1248,20 @@ def _notebook_code_cells(path: Path) -> list[tuple[int, str]]:
         ) from None
     if not isinstance(document, dict) or not isinstance(document.get("cells", []), list):
         raise ScanError(
-            f"{_relative(path)}: is not a notebook document, so its code cells were " f"not checked"
+            f"{_relative(path)}: is not a notebook document, so its code cells were "
+            f"not checked"
         )
     cells = []
     for index, cell in enumerate(document.get("cells", [])):
-        if not isinstance(cell, dict) or cell.get("cell_type") != "code":
+        if not isinstance(cell, dict):
+            # A valid non-code cell is skipped below; a cell that is not an object at
+            # all is malformed, and skipping it would let an invalid notebook report
+            # clean - the opposite of how every other malformed shape is treated here.
+            raise ScanError(
+                f"{_relative(path)}#cell{index}: is {type(cell).__name__}, not a cell "
+                f"object, so it was not checked"
+            )
+        if cell.get("cell_type") != "code":
             continue
         source = cell.get("source", "")
         if isinstance(source, list):
@@ -1232,8 +1304,10 @@ def _magic_argument(rest: str) -> str:
             ast.parse(candidate)
             return candidate
         except SyntaxError:
-            head, separator, tail = candidate.partition(" ")
-            if not separator:
+            pieces = candidate.split(maxsplit = 1)
+            head = pieces[0] if pieces else ""
+            tail = pieces[1] if len(pieces) > 1 else ""
+            if len(pieces) < 2:
                 break
             if head.startswith("-"):
                 # An option may carry a value of any shape: `%timeit -s "x=1" exec(...)`
@@ -1285,7 +1359,7 @@ def _capture_target(line: str):
             continue
         if len(tree.body) != 1 or not isinstance(tree.body[0], ast.Assign):
             continue
-        return indent, target, operator, line[match.end() :], tree.body[0].targets
+        return indent, target, operator, line[match.end():], tree.body[0].targets
     return None
 
 
@@ -1640,7 +1714,7 @@ def _parse_cell(code: str, filename: str):
         for candidate in (code, _neutralised(code)):
             try:
                 return ast.parse(candidate, filename = filename)
-            except (SyntaxError, ValueError):
+            except (SyntaxError, ValueError, MemoryError, RecursionError):
                 continue
     return None
 
@@ -1719,13 +1793,18 @@ def scan_file(path: Path) -> list[dict]:
         return []
     try:
         tree = ast.parse(source, filename = str(path))
-    except (SyntaxError, ValueError) as error:
+    except (SyntaxError, ValueError, MemoryError, RecursionError) as error:
         # A file that cannot be parsed has not been checked, and reporting it as clean
         # is the same bypass as swallowing a RecursionError. The comment here used to
         # defer to compileall in the same job, but both syntax-reporting steps in
         # lint-ci.yml are `continue-on-error: true`, so nothing else fails the build.
         # ValueError covers a source containing a NUL byte, which ast.parse rejects
-        # separately from a syntax error.
+        # separately from a syntax error. MemoryError and RecursionError cover the
+        # parser's own limits: about ten thousand nested unary operators raises
+        # `MemoryError: Parser stack overflowed`, which is a resource limit rather than
+        # a real memory problem. Letting it escape aborted the whole run before any
+        # other file was scanned or reported, which is the one-bad-file-hides-every-
+        # finding failure mode this file has now hit three times.
         raise ScanError(
             f"{_relative(path)}: could not be parsed ({error.__class__.__name__}), so "
             f"it was not checked for interpolated dynamic execution"

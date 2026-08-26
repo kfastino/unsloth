@@ -42,10 +42,15 @@ def _module_level_statements(body):
     was reported as light, never added to the workflow's ignore list, and would stop
     collecting on the light runner - the failure this guard exists to prevent.
 
-    Function and class bodies are still excluded: an import in there is paid lazily.
+    Function bodies are still excluded, since an import in there is paid lazily. A
+    CLASS body is not: it executes while the class is built, which happens at import
+    time, so `class C: import torch` costs exactly as much as a bare import.
     """
     for node in body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if isinstance(node, ast.ClassDef):
+            yield from _module_level_statements(node.body)
             continue
         yield node
         for field in ("body", "orelse", "finalbody", "handlers"):
